@@ -40,7 +40,7 @@ In a warm session, run `/keepwarm` to arm six hours. Use `/keepwarm 90m` for a s
 
 A detected cold write automatically arms at least three hours of keepwarm. `/cache-tax` shows the current cache estimate, warming window and this session's cold-write tally.
 
-Windows belong to individual sessions. An already-cold session waits for your next turn before pinging. A window ends at its deadline; `/keepwarm off` also cancels it and clears the always setting.
+Windows belong to individual sessions. An already-cold session waits for your next turn before pinging. With `always` on, each turn moves the deadline to six hours after it, so a session left open all day does not outlive its window. A window ends at its deadline; `/keepwarm off` also cancels it and clears the always setting.
 
 ### A recorded warming ping
 
@@ -60,7 +60,7 @@ New to caching? [Anthropic explains how Claude Code uses it](https://code.claude
 
     /keepwarm               keep warm for six hours
     /keepwarm 90m           keep warm for a window of your own (also 2h30m, 6h)
-    /keepwarm always        arm a six-hour window at every session start, remembered across sessions
+    /keepwarm always        keep every session warm until six hours after its last turn, remembered across sessions
     /keepwarm 6h every 2m   pinging every two minutes; a testing knob, floor 1m, forgotten after this window
     /keepwarm status        the warming window, next ping and last receipt
     /keepwarm off           stop, forget the window, and turn always off
@@ -100,7 +100,7 @@ Reach L2, drives Claude. Sees every prompt you type, every model request's timin
     1. Reads:    of each prompt, whether it starts with a slash and nothing else (the text is passed on untouched, never kept, never logged); the time; the token counts and model id the engine already holds on turn.complete and on the fork's reply; the resume fields Claude Code computes for settings hooks; the command list, the session id and, when a resumed session's fields carry no model id, the session's model once at start; from its own $.store, the keepwarm deadline and the ping period keyed by session id, plus the global always switch and guard mode
     2. Runs:     one $.model.fork per idle stretch inside a keepwarm window, one per ping period (50 minutes unless the testing knob set it, floor 1 minute), never outside the window, never onto a cache the mod already knows is cold, never after a readback that read nothing or wrote at least a tenth of what it read
     3. Sends:    nothing leaves the machine except the fork, an API request over the session's own transcript with a fixed one-line prompt
-    4. Persists: in $.store, the keepwarm deadline and the ping period under this session's id, and the always switch and the guard mode for every session; a window that has ended is deleted at stop and at this session's next start, together with the bare keys of a 2.1.0 store; another session's keys are never deleted here, because a read followed by a delete cannot be made atomic against that session renewing its window, so a session that armed keepwarm and never came back leaves two small keys behind; the session's cold-write tally lives in memory and dies with the session
+    4. Persists: in $.store, the keepwarm deadline and the ping period under this session's id (with always on, rewritten after each turn), and the always switch and the guard mode for every session; a window that has ended is deleted at stop and at this session's next start, together with the bare keys of a 2.1.0 store; another session's keys are never deleted here, because a read followed by a delete cannot be made atomic against that session renewing its window, so a session that armed keepwarm and never came back leaves two small keys behind; the session's cold-write tally lives in memory and dies with the session
     5. Hostile input: the only text it parses is the argument of its two commands, matched against a duration regex and five literals; of the prompt text only the first non-blank character is inspected, for a slash; tool results and files never reach a branch; the fork's prompt is a constant, so nothing crafted can be sent through it; a refusal only ever drops the user's own message, and the resend is unconditional; if a hook throws, the engine skips it and the message enters unguarded, with one dim line
 
 ## Cost and the plan-limit question

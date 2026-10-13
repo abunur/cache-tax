@@ -276,7 +276,7 @@ function card(s: State, now: number): string {
   lines.push(`context     ${s.ctx.toLocaleString('en-US')} tokens`)
   lines.push(`cold cost   ${fmtUsd(coldUsd(s))} to re-write it (warm turn ${fmtUsd(warmUsd(s))})`)
   const always = s.always ? ' (always)' : ''
-  const idle = s.always ? 'off until the next session start, which arms 6h00m (always)' : 'off (/keepwarm to arm it for 6h00m)'
+  const idle = s.always ? 'off until the next turn, which arms 6h00m (always)' : 'off (/keepwarm to arm it for 6h00m)'
   lines.push(`keepwarm    ${s.deadline ? (statusText(s, now) ?? '').replace(/^keepwarm /, 'on, ') + always : s.stopped ? `stopped, ${s.stopped}${always}` : idle}`)
   const pings = breakEvenPings(s)
   if (pings != null) lines.push(`break-even  up to ${pings} pings at the read rate cost one cold write, about ${fmtDuration(pings * s.every)} of idle at one ping per ${fmtDuration(s.every)}`)
@@ -411,7 +411,7 @@ export const register: Register = on => {
       await $.store.set(KEY_ALWAYS, true)
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
       const cold = isCold(s, now) ? `. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn` : ''
-      return { text: `keepwarm always on: every session starts with a ${fmtDuration(DEFAULT_WINDOW_MS)} window; /keepwarm off turns it off for good${cold}` }
+      return { text: `keepwarm always on: every session stays warm until ${fmtDuration(DEFAULT_WINDOW_MS)} after its last turn; /keepwarm off turns it off for good${cold}` }
     }
     if (!words.length) {
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
@@ -474,6 +474,12 @@ export const register: Register = on => {
     const r = await next(e)
     if (e.agentId) return r
     const now = await $.clock.now()
+    // Always is a rolling window: each main-session turn pushes the deadline to six hours past it.
+    if (s.always && s.deadline < now + DEFAULT_WINDOW_MS) {
+      s.deadline = now + DEFAULT_WINDOW_MS
+      s.stopped = null
+      await $.store.set(deadlineKey(s), s.deadline)
+    }
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
