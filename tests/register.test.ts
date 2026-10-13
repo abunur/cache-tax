@@ -323,6 +323,38 @@ describe('guard', () => {
     expect(w.entered).toEqual(['hi'])
   })
 
+  test('a refused send leaves a Resend button that pays it once', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    expect(await ui.find({ key: 'resend' })).toBeUndefined()
+    const first = await $.prompt.submit(prompt('summarize the plan'))
+    expect(first.drop).toMatch(/Send it again or press Resend to pay it/)
+    expect(await ui.find({ key: 'resend' })).toBeDefined()
+    await ui.press({ key: 'resend' })
+    expect(w.entered).toEqual(['summarize the plan'])
+    expect(await ui.find({ key: 'resend' })).toBeUndefined()
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/1 cold write paid/)
+  })
+
+  test('typing a new prompt retires the Resend button', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
+    const ui = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    await $.prompt.submit(prompt('hi'))
+    expect(await ui.find({ key: 'resend' })).toBeDefined()
+    await $.prompt.submit(prompt('hi'))
+    expect(await ui.find({ key: 'resend' })).toBeUndefined()
+    expect(w.entered).toEqual(['hi'])
+  })
+
   test('lets slash commands, warm sends and small contexts through', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const w = world(on, [])

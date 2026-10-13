@@ -1,7 +1,7 @@
 {
   "name": "cache-tax",
-  "version": "2.2.1",
-  "description": "A Claude Code mod that keeps the one-hour prompt cache warm during breaks and stops a cold send once with its estimated rewrite cost. Warming uses model requests and costs tokens. Requires Claude Code 2.1.287+.",
+  "version": "2.2.1-resend.2",
+  "description": "Local fork of cache-tax (karanb192/cache-tax 2.2.1) that adds a Resend and pay button to a refused cold send and makes /keepwarm always a rolling 6h window from the last turn. Replaces cache-tax@claude-code-mods; do not enable both.",
   "author": {
     "name": "Karan Bansal"
   },

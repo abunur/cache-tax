@@ -42,6 +42,8 @@ export type State = {
   guard: GuardMode
   ackedAt: number
   coldWritePending: boolean
+  /** The text of the prompt the guard dropped, kept so the band can offer to resend it. */
+  blocked: string | null
   misses: Miss[]
   pending: { cancel: () => void } | null
   last: PingRecord | null
@@ -127,6 +129,7 @@ export function resetForClear(s: State) {
   s.compacted = false
   s.ackedAt = 0
   s.coldWritePending = false
+  s.blocked = null
   s.misses = []
   disarm(s)
 }
@@ -157,6 +160,12 @@ function statusText(s: State, now: number): string | undefined {
 function updateStatus($: EngineInterface, s: State, now: number) {
   if (s.hasBand) $.ui.invalidate('ui.render')
   else $.ui.status(statusText(s, now))
+}
+
+function clearBlocked($: EngineInterface, s: State) {
+  if (s.blocked === null) return
+  s.blocked = null
+  if (s.hasBand) $.ui.invalidate('ui.render')
 }
 
 function disarm(s: State) {
@@ -286,10 +295,35 @@ function card(s: State, now: number): string {
   return lines.join('\n')
 }
 
+/** Pays a held cold write on the person's behalf: the dropped prompt goes back in as their own words. */
+async function resend($: EngineInterface, s: State) {
+  const text = s.blocked
+  if (text === null) return
+  const now = await $.clock.now()
+  s.blocked = null
+  s.ackedAt = 0
+  // A plugin's own submission skips this mod's guard, so the cold write is marked here.
+  s.coldWritePending = isCold(s, now) && s.ctx >= BIG_TOKENS
+  updateStatus($, s, now)
+  try {
+    await $.prompt.submit({ text, asUser: true })
+  } catch (err) {
+    s.blocked = text
+    s.coldWritePending = false
+    updateStatus($, s, await $.clock.now())
+    $.ui.toast(`cache-tax: resend failed, ${err instanceof Error ? err.message : String(err)}`)
+  }
+}
+
+function preview(text: string): string {
+  const line = text.trim().replace(/\s+/g, ' ')
+  return line.length > 48 ? line.slice(0, 47) + '…' : line
+}
+
 export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
-    guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
+    guard: 'refuse', ackedAt: 0, coldWritePending: false, blocked: null, misses: [], pending: null, last: null, stopped: null,
   }
 }
 
@@ -312,26 +346,35 @@ export const register: Register = on => {
     if (!s.hasBand || e.props.hasSurvey) return rest
     const now = await $.clock.now()
     const text = statusText(s, now)
-    if (!text || (s.deadline && now >= s.deadline)) return rest
-    const state = s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
-    const color = noColor ? undefined : state === 'warm' ? 'success' : state === 'cold' ? (light ? '#c15f3c' : '#d97757') : undefined
-    const { Box, Text } = $.ui.resolve(e)
-    const asset = statusIcons[light ? 'light' : 'dark'][state === 'warm' || state === 'cold' ? state : 'neutral']
-    const icon = noColor ? Text({ bold: true, children: ['[>]'] })
-      : e.surface === 'terminal' ? $.ui.resolve(e).Image({ source: { png: asset.png }, columns: 3, rows: 1, alt: '[>]' })
-      : e.surface === 'desktop' ? $.ui.resolve(e).Svg({ source: asset.svg, width: 18, height: 18, alt: 'Cache Tax' })
-      : Text({ color, bold: true, children: ['[>]'] })
-    return Box({ flexDirection: 'column', children: [
-      rest,
-      Box({ flexDirection: 'row', alignItems: 'center', children: [
+    const showStatus = Boolean(text) && !(s.deadline && now >= s.deadline)
+    const held = s.blocked
+    if (!showStatus && held === null) return rest
+    const { Box, Text, Button } = $.ui.resolve(e)
+    const rows = [rest]
+    if (showStatus) {
+      const state = s.stopped ? 'stopped' : !s.lastRequestAt || s.compacted ? 'unknown' : isCold(s, now) ? 'cold' : 'warm'
+      const color = noColor ? undefined : state === 'warm' ? 'success' : state === 'cold' ? (light ? '#c15f3c' : '#d97757') : undefined
+      const asset = statusIcons[light ? 'light' : 'dark'][state === 'warm' || state === 'cold' ? state : 'neutral']
+      const icon = noColor ? Text({ bold: true, children: ['[>]'] })
+        : e.surface === 'terminal' ? $.ui.resolve(e).Image({ source: { png: asset.png }, columns: 3, rows: 1, alt: '[>]' })
+        : e.surface === 'desktop' ? $.ui.resolve(e).Svg({ source: asset.svg, width: 18, height: 18, alt: 'Cache Tax' })
+        : Text({ color, bold: true, children: ['[>]'] })
+      rows.push(Box({ flexDirection: 'row', alignItems: 'center', children: [
         Box({ flexShrink: 0, children: [icon] }),
         Text({ children: [
           ' cache-tax · ',
           Text({ color, bold: true, children: [state] }),
           ` · ${text}`,
         ] }),
-      ] }),
-    ] })
+      ] }))
+    }
+    if (held !== null) {
+      rows.push(Box({ flexDirection: 'row', alignItems: 'center', gap: 1, children: [
+        Text({ dimColor: true, children: [` held: "${preview(held)}"`] }),
+        Button({ key: 'resend', label: 'Resend and pay', onPress: () => resend($, s) }),
+      ] }))
+    }
+    return Box({ flexDirection: 'column', children: rows })
   })
 
   on('session.start', async ($, e, next) => {
@@ -450,19 +493,26 @@ export const register: Register = on => {
     if (e.origin.kind === 'plugin') return next(e)
     if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
-    if (!isCold(s, now) || s.ctx < BIG_TOKENS) return next(e)
+    if (!isCold(s, now) || s.ctx < BIG_TOKENS) {
+      clearBlocked($, s)
+      return next(e)
+    }
     if (s.guard === 'warn') {
+      clearBlocked($, s)
       $.ui.log(`${guardText(s, now)} Sending anyway; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
       s.coldWritePending = true
       return next(e)
     }
     if (s.ackedAt === s.lastRequestAt) {
+      clearBlocked($, s)
       s.ackedAt = 0
       s.coldWritePending = true
       return next(e)
     }
     s.ackedAt = s.lastRequestAt
-    return { drop: `cache-tax: ${guardText(s, now)} Send it again to pay it, and keepwarm will then hold the cache for ${fmtDuration(AUTO_WARM_MS)}. Or /clear and start from a note.` }
+    s.blocked = e.text
+    if (s.hasBand) $.ui.invalidate('ui.render')
+    return { drop: `cache-tax: ${guardText(s, now)} Send it again${s.hasBand ? ' or press Resend' : ''} to pay it, and keepwarm will then hold the cache for ${fmtDuration(AUTO_WARM_MS)}. Or /clear and start from a note.` }
   })
 
   on('turn.step', async function* ($, e, next) {
