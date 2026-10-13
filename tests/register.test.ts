@@ -595,10 +595,26 @@ describe('keepwarm', () => {
     const w = world(on, [], { store })
     await $.session.start(session)
     const r = await $.command.run(run('keepwarm', 'always'))
-    expect(r.text).toMatch(/^keepwarm always on: every session starts with a 6h00m window/)
+    expect(r.text).toMatch(/^keepwarm always on: every session stays warm until 6h00m after its last turn/)
     expect(store.get('always')).toBe(true)
     expect(store.get('deadline:S1')).toBe(START + 6 * HOUR)
     expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
+  })
+
+  test('always rolls the window forward with each turn, so a long session never outlives it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    const w = world(on, [warm, warm], { store })
+    await $.session.start(session)
+    expect(store.get('deadline:S1')).toBe(START + 6 * HOUR)
+    // A turn five and a half hours in: a fixed window would end 30m later, before the first ping.
+    await clock.advance(5 * HOUR + 30 * MIN)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 11 * HOUR + 30 * MIN)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
   })
 
   test('the ping figure counts output tokens at the model\'s rate, Sonnet 5 priced as itself', async ($, on) => {
@@ -699,7 +715,7 @@ describe('keepwarm', () => {
     await clock.advance(1 * MIN)
     expect(w.forks.length).toBe(0)
     const r = await $.command.run(run('keepwarm', 'always'))
-    expect(r.text).toBe('keepwarm always on: every session starts with a 6h00m window; /keepwarm off turns it off for good. The cache is cold now, so the first ping comes 50m after the next turn')
+    expect(r.text).toBe('keepwarm always on: every session stays warm until 6h00m after its last turn; /keepwarm off turns it off for good. The cache is cold now, so the first ping comes 50m after the next turn')
     await clock.advance(60 * MIN)
     expect(w.forks.length).toBe(0)
     await $.turn.complete(turn())
