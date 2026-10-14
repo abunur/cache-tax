@@ -1,6 +1,9 @@
 import type { EngineInterface, Register } from 'claude-code'
 import { statusIcons } from './status-icons'
 
+// After every warm ping, so a cache display (cache-meter) can restart its countdown; contract in types/index.d.ts.
+const LAST_PING = { plugin: 'cache-tax', key: 'lastPing' } as const
+
 const TTL_MS = 60 * 60 * 1000
 const PING_AFTER_MS = 50 * 60 * 1000
 const MIN_PING_MS = 60 * 1000
@@ -255,6 +258,11 @@ async function ping($: EngineInterface, s: State) {
   s.last = { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, usd, warm }
   if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
   s.lastRequestAt = now
+  try {
+    await $.state.set(LAST_PING, { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens })
+  } catch {
+    // A display that misses one ping is harmless; the warming loop must not stop over it.
+  }
   await arm($, s)
 }
 

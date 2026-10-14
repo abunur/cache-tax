@@ -1,7 +1,8 @@
 {
   "name": "cache-tax",
-  "version": "2.2.1-resend.2",
-  "description": "Local fork of cache-tax (karanb192/cache-tax 2.2.1) that adds a Resend and pay button to a refused cold send and makes /keepwarm always a rolling 6h window from the last turn. Replaces cache-tax@claude-code-mods; do not enable both.",
+  "version": "2.2.1-resend.3",
+  "description": "Local fork of cache-tax (karanb192/cache-tax 2.2.1) that adds a Resend and pay button to a refused cold send and makes /keepwarm always a rolling 6h window from the last turn. Publishes each warm ping as state cache-tax.lastPing for cache-meter. Replaces cache-tax@claude-code-mods; do not enable both.",
+  "types": "./types/index.d.ts",
   "author": {
     "name": "Karan Bansal"
   },
