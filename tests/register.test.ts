@@ -2,7 +2,8 @@ import { describe, expect, mock, test, tier } from 'claude-code/testing'
 import type { CommandRunInput, ConfigSetInput, ModelForkResult, On, PromptSubmitInput, RenderPropsOf, SessionStartInput, TurnCompleteInput, TurnUsage } from 'claude-code'
 
 import { statusIcons } from '../hooks/status-icons'
-import { fmtDuration, freshState, parseDuration, resetForClear, seedFromResume } from '../hooks/register'
+import { fmtDuration, freshState, parseDuration, reportText, resetForClear, seedFromResume } from '../hooks/register'
+import type { Rec } from '../hooks/register'
 
 tier('user')
 
@@ -34,7 +35,9 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string; model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string } = {}) {
+type RunAnswer = { exitCode: number; stdout?: string; stderr?: string }
+
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string; model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; home?: string; version?: string; run?: (argv: readonly string[]) => RunAnswer | undefined; sendFails?: string } = {}) {
   if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
@@ -43,7 +46,11 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
     on('store.keys', () => ({ value: [...store.keys()] }))
   } else mock.store(on, {})
   const reads = { theme: 0, env: 0 }
-  on('env.get', ($, e) => { reads.env++; return { value: e.name === 'NO_COLOR' && opts.noColor ? '1' : undefined } })
+  on('env.get', ($, e) => {
+    if (e.name !== 'NO_COLOR') return { value: opts.home && e.name === 'HOME' ? opts.home : undefined }
+    reads.env++
+    return { value: opts.noColor ? '1' : undefined }
+  })
   on('config.list', () => {
     reads.theme++
     return { value: [{ key: 'theme', label: 'Theme', kind: 'choice', value: opts.theme?.value ?? 'dark', provider: { plugin: 'engine', tier: 'core' }, isLocked: false }] }
@@ -66,6 +73,22 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('ui.log', ($, e) => { logs.push(e.text); return { value: undefined } })
   on('ui.status', ($, e) => { status.push(e.text); return { value: undefined } })
   on('ui.render', ($, e) => $.ui.resolve(e).Text({ children: [opts.bandText ?? ''] }))
+  const runs: string[][] = []
+  const sent: Array<{ to: string; text: string }> = []
+  const written: Array<{ path: string; text: string }> = []
+  on('process.run', ($, e) => {
+    runs.push([...e.argv])
+    const a = opts.run?.(e.argv) ?? { exitCode: 0 }
+    return { value: { exitCode: a.exitCode, stdout: a.stdout ?? '', stderr: a.stderr ?? '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('fs.write', ($, e) => { written.push({ path: e.path, text: e.text }); return { value: undefined } })
+  on('session.send', ($, e) => {
+    sent.push({ to: e.to, text: e.text })
+    return opts.sendFails ? { isDelivered: false as const, reason: opts.sendFails } : { isDelivered: true as const }
+  })
+  on('session.version', () => ({ value: { version: opts.version ?? '2.1.299' } }))
+  on('session.end', ($, e) => ({ sessionId: e.sessionId }))
+  on('session.receive', ($, e) => ({ text: e.text }))
   on('model.fork', () => {
     forks.push(forks.length)
     const a = forkAnswers.shift()
@@ -75,7 +98,7 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
     const value: ModelForkResult = { isAnswered: true, text: 'warm', usage: { input_tokens: a.input ?? 2, output_tokens: a.out ?? 1, cache_read_input_tokens: a.read, cache_creation_input_tokens: a.write } }
     return { value }
   })
-  return { forks, status, logs, entered, reads }
+  return { forks, status, logs, entered, reads, runs, sent, written }
 }
 
 const warm: ForkAnswer = { read: 200000, write: 0 }
@@ -873,4 +896,167 @@ describe('store per session', () => {
     await $.session.start(session)
     expect([...store.keys()]).toEqual(['deadline:other', 'every:other'])
   })
+})
+
+const lookup = (sid: string, local: string, title: string, isArchived = false) => (argv: readonly string[]): RunAnswer | undefined =>
+  argv.includes('cache-tax-lookup') && argv.includes(sid) ? { exitCode: 0, stdout: JSON.stringify({ sessionId: local, cliSessionId: sid, title, isArchived }) } : undefined
+
+const rec = (over: Partial<Rec> = {}): Rec => ({
+  at: START, warmAt: START, ctx: 200000, model: 'claude-opus-5-5', cwd: '/work/recap', title: 'Recap', local: 'local_r', version: '2.1.299',
+  deadline: START + 48 * HOUR, every: 50 * MIN, endedAt: START, endReason: 'other', ...over,
+})
+
+const ended = (reason: 'other' | 'prompt_input_exit' | 'clear' = 'other') => ({ reason, sessionId: 'S1', resume: { id: 'S1' } })
+
+describe('restart after a quit', () => {
+  test('a peer message on a cold cache is priced and sent, a typed one is still refused once', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    const peer = await $.prompt.submit({ text: 'FYI from the other session', wait: false, origin: { kind: 'peer' } as PromptSubmitInput['origin'] })
+    expect(peer.drop).toBe(undefined)
+    expect(w.logs.at(-1)).toMatch(/went cold .* It came from another session or a trigger, so it goes through/)
+    await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
+    await clock.advance(3 * HOUR)
+    // Claude Desktop hands a peer delivery in as an SDK turn; the envelope gives it away.
+    const wrapped = await $.prompt.submit({ text: '<cross-session-message from="local_x" name="other">\nFYI\n</cross-session-message>', wait: false, origin: { kind: 'sdk' } })
+    expect(wrapped.drop).toBe(undefined)
+    await $.turn.complete(turn())
+    await clock.advance(3 * HOUR)
+    const typed = await $.prompt.submit(prompt('hi'))
+    expect(typed.drop).toMatch(/went cold/)
+  })
+
+  test('ending under a live warm window records it and leaves a watcher for a quick relaunch', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store, home: '/Users/me', run: lookup('S1', 'local_s1', 'Recap') })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '48h'))
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    await $.session.end(ended())
+    const r = store.get('rec:S1') as Rec
+    expect(r).toMatchObject({ endedAt: START + 10 * MIN, endReason: 'other', local: 'local_s1', title: 'Recap', warmAt: START, version: '2.1.299', deadline: START + 48 * HOUR })
+    const watcher = w.runs.find(a => a[0] === '/usr/bin/perl')
+    expect(watcher?.slice(-3)).toEqual([String(Math.floor((START + HOUR - 3 * MIN) / 1000)), 'claude://code/continue?session=local_s1', '/Users/me/.claude/cache-tax-revive.lock'])
+  })
+
+  test('no watcher when the cache is about to go cold, the window is off, or the session cleared', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store, home: '/Users/me', run: lookup('S1', 'local_s1', 'Recap') })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.session.end(ended())
+    expect(store.has('rec:S1')).toBe(false)
+    // A ping period past the point where the cache is near cold, so nothing renews it first.
+    await $.command.run(run('keepwarm', '48h every 59m'))
+    await clock.advance(55 * MIN)
+    await $.session.end(ended())
+    expect((store.get('rec:S1') as Rec).endedAt).toBe(START + 55 * MIN)
+    await $.session.end(ended('clear'))
+    expect(w.runs.some(a => a[0] === '/usr/bin/perl')).toBe(false)
+  })
+
+  test('the first session back revives the warm ones once, and reports every one to Bear', async ($, on) => {
+    const now = START + 20 * MIN
+    const clock = mock.clock(on, { now })
+    const store = new Map<string, unknown>([
+      ['rec:warm', rec({ local: 'local_w', title: 'Recap' })],
+      ['rec:cold', rec({ local: 'local_c', title: 'Old', warmAt: START - 2 * HOUR })],
+      ['rec:upgraded', rec({ local: 'local_u', title: 'Upgraded', version: '2.1.298' })],
+      ['rec:left', rec({ local: null, endReason: 'prompt_input_exit' })],
+      ['rec:over', rec({ local: 'local_o', deadline: START })],
+      ['rec:archived', rec({ local: 'local_a' })],
+    ])
+    const run = (argv: readonly string[]) => lookup('archived', 'local_a', 'Gone', true)(argv) ?? (argv[0]?.endsWith('bearcli') ? { exitCode: 0 } : undefined)
+    const w = world(on, [], { store, sid: 'mine', home: '/Users/me', run })
+    await $.session.start(session)
+    expect(w.sent).toEqual([])
+    await clock.advance(3000)
+    expect(w.sent.map(m => m.to)).toEqual(['local_w'])
+    expect(w.sent[0].text).toMatch(/^\[cache-tax revive\]/)
+    const bear = w.runs.find(a => a[0].endsWith('bearcli'))!
+    expect(bear[1]).toBe('create')
+    expect(bear[2]).toMatch(/^Keepwarm sessions after Claude quit, /)
+    const body = bear[4]
+    expect(body).toMatch(/\*\*Recap\*\*: restarted automatically with 40m of warm cache left/)
+    expect(body).toMatch(/\*\*Old\*\*: cold since .*; reopening it re-writes 200,000 tokens, about \$2\.00\. \[Open\]\(claude:\/\/code\/continue\?session=local_c\)/)
+    expect(body).toMatch(/\*\*Upgraded\*\*: not restarted, because Claude Code changed from 2\.1\.298 to 2\.1\.299/)
+    expect(body).not.toMatch(/Gone|local_o/)
+    expect(bear.slice(-2)).toEqual(['--tags', 'claude/keepwarm'])
+    expect(w.logs.at(-1)).toMatch(/^3 keepwarm sessions were shut down when Claude quit; 1 restarted while still warm, 2 left for you to reopen\. Details in Bear/)
+    expect(w.runs.some(a => a[0] === '/usr/bin/osascript')).toBe(true)
+    expect((store.get('rec:warm') as Rec).handledAt).toBe(now + 3000)
+    expect((store.get('rec:left') as Rec).handledAt).toBe(undefined)
+  })
+
+  test('a second session back does not revive or report again', async ($, on) => {
+    const clock = mock.clock(on, { now: START + 10 * MIN })
+    const store = new Map<string, unknown>([['rec:warm', rec({ handledAt: START + 5 * MIN })]])
+    const w = world(on, [], { store, sid: 'mine' })
+    await $.session.start(session)
+    await clock.advance(3000)
+    expect(w.sent).toEqual([])
+    expect(w.runs.some(a => a[0].endsWith('bearcli'))).toBe(false)
+  })
+
+  test('without Bear the report goes to a file', async ($, on) => {
+    const clock = mock.clock(on, { now: START + 10 * MIN })
+    const store = new Map<string, unknown>([['rec:warm', rec()]])
+    const w = world(on, [], { store, sid: 'mine', home: '/Users/me', run: argv => argv[0]?.endsWith('bearcli') ? { exitCode: 1, stderr: 'no Bear' } : undefined, sendFails: 'no such session' })
+    await $.session.start(session)
+    await clock.advance(3000)
+    expect(w.written[0]?.path).toBe('/Users/me/.claude/cache-tax-report.md')
+    expect(w.written[0]?.text).toMatch(/could not be restarted \(no such session\)/)
+    expect(w.logs.at(-1)).toMatch(/Details in \/Users\/me\/\.claude\/cache-tax-report\.md/)
+  })
+
+  test('a revived session takes its warm clock from its record, pings, and swallows the revive message', async ($, on) => {
+    const now = START + 20 * MIN
+    const clock = mock.clock(on, { now })
+    const store = new Map<string, unknown>([['deadline:S1', START + 48 * HOUR], ['rec:S1', rec({ warmAt: START, endedAt: START + 15 * MIN })]])
+    const w = world(on, [warm], { store })
+    await $.session.start(session)
+    // The payload dates the last reply three hours back; the pings kept it warm since.
+    await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 3 * 3600, context_tokens: 200000, prompt_cache_likely_expired: true, model: 'claude-opus-5-5' })
+    expect(w.logs.some(l => l.startsWith('resuming cold'))).toBe(false)
+    expect((store.get('rec:S1') as Rec).endedAt).toBe(undefined)
+    const got = await $.session.receive({ origin: { kind: 'peer' }, text: '[cache-tax revive] Claude restarted' })
+    expect(got.consumed).toBe('cache-tax revive')
+    expect(w.logs.at(-1)).toMatch(/restarted after Claude came back with 40m of warm cache left/)
+    const asTurn = await $.prompt.submit({ text: '<cross-session-message from="local_m">[cache-tax revive] Claude restarted</cross-session-message>', wait: false, origin: { kind: 'sdk' } })
+    expect(asTurn.drop).toMatch(/^cache-tax: restarted after Claude came back/)
+    expect(w.entered).toEqual([])
+    await clock.advance(30 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('a loop that stopped itself keeps the reason in its record', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    world(on, [{ isAnswered: false, reason: 'api-error', status: 529, error: 'server_error', usage: usage() }], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '6h'))
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect((store.get('rec:S1') as Rec).stop).toEqual({ at: START + 50 * MIN, why: 'the API call failed (529)' })
+  })
+
+  test('the next process of that session says why in its status card', async ($, on) => {
+    mock.clock(on, { now: START + 2 * HOUR })
+    const store = new Map<string, unknown>([['rec:S1', rec({ deadline: 0, endedAt: undefined, endReason: undefined, stop: { at: START, why: 'the API call failed (529)' } })]])
+    world(on, [], { store })
+    await $.session.start(session)
+    const card = await $.command.run(run('cache-tax', ''))
+    expect(card.text).toMatch(/last stop   .*, the API call failed \(529\)/)
+  })
+})
+
+test('the report names a session by folder when it has no title', () => {
+  const { body } = reportText([{ sid: 'abcdef123456', rec: rec({ title: null, cwd: '/Volumes/Black Razor/video projects' }), warmLeft: 0, revived: 'skipped' }], START, '2.1.299')
+  expect(body).toMatch(/\*\*video projects\*\*: cold since/)
 })

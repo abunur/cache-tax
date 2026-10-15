@@ -15,6 +15,39 @@ const KEY_DEADLINE = 'deadline'
 const KEY_EVERY = 'every'
 const KEY_GUARD = 'guard'
 const KEY_ALWAYS = 'always'
+const KEY_REC = 'rec'
+const RECORD_KEEP_MS = 7 * 24 * 60 * 60 * 1000
+// A session revived with less warm time than this would only ping into a cache about to expire.
+const REVIVE_MARGIN_MS = 3 * 60 * 1000
+const REVIVE_MARK = '[cache-tax revive]'
+const REVIVE_TEXT = `${REVIVE_MARK} Claude restarted while this session's cache was still warm; keepwarm resumes here. No reply needed.`
+// Origins a person typed or sent; everything else (peer sessions, triggers, relays) has no one to resend a refused send.
+const HUMAN_ORIGINS = new Set(['composer', 'bridge', 'sdk', 'slack-ping'])
+// Claude Desktop hands some automated deliveries in as SDK turns; their envelope is the only tell.
+const ENVELOPE = /^\s*<(cross-session-message|side-sessions-event|ci-monitor-event|task-notification)[\s>]/
+const DESKTOP_SESSIONS = 'Library/Application Support/Claude/claude-code-sessions'
+const BEAR_CLI = '/Applications/Bear.app/Contents/MacOS/bearcli'
+const REPORT_TAG = 'claude/keepwarm'
+const WATCH_LOCK = '.claude/cache-tax-revive.lock'
+
+// Left behind by a session that ends with a live window: waits for Claude to quit and come back
+// while the cache is still warm, then opens this one session; its start revives the rest by message.
+// Args: $1 the epoch second the cache goes cold, $2 the session's claude:// link, $3 the lock dir.
+const WATCH_SCRIPT = [
+  'until=$1; link=$2; lock=$3',
+  // Only a quit of the whole app counts; a single session stopping leaves Claude running.
+  'i=0; while pgrep -x Claude >/dev/null; do i=$((i+1)); [ $i -gt 24 ] && exit 0; sleep 5; done',
+  'while ! pgrep -x Claude >/dev/null; do [ "$(date +%s)" -ge "$until" ] && exit 0; sleep 10; done',
+  'sleep 30',
+  '[ "$(date +%s)" -ge "$until" ] && exit 0',
+  // A session already started revives the others itself.
+  "pgrep -f 'MacOS/claude ' >/dev/null && exit 0",
+  'find "$lock" -maxdepth 0 -mmin +90 -exec rmdir {} \\; 2>/dev/null',
+  'mkdir "$lock" 2>/dev/null || exit 0',
+  'open -g "$link"',
+  'sleep 120; rmdir "$lock" 2>/dev/null',
+].join('\n')
+const DETACH = 'exit 0 if fork; POSIX::setsid(); open STDIN, "</dev/null"; open STDOUT, ">/dev/null"; open STDERR, ">&STDOUT"; exec "/bin/sh", "-c", shift, "cache-tax-watch", @ARGV'
 
 // $ per million tokens, [cache read, 1h cache write, output], list prices September 2026.
 // Longer family names first: a model id matches the first row it contains.
@@ -51,7 +84,35 @@ export type State = {
   pending: { cancel: () => void } | null
   last: PingRecord | null
   stopped: string | null
+  cwd: string | null
+  title: string | null
+  /** The desktop's own id for this session (local_…), null outside Claude Desktop, undefined until looked up. */
+  local: string | null | undefined
+  version: string | null
+  /** Why and when the loop last stopped on its own, kept across restarts so a later status can say. */
+  lastStop: { at: number; why: string } | null
 }
+
+/** What a session with a live window leaves in the store, so the next session after a quit can report and revive it. */
+export type Rec = {
+  at: number
+  /** The last request that touched the cache, pings included; the resume payload only knows the last reply. */
+  warmAt: number
+  ctx: number
+  model: string | null
+  cwd: string | null
+  title: string | null
+  local: string | null
+  version: string | null
+  deadline: number
+  every: number
+  endedAt?: number
+  endReason?: string
+  stop?: { at: number; why: string }
+  handledAt?: number
+}
+
+export type ReviveRow = { sid: string; rec: Rec; warmLeft: number; revived: 'sent' | 'skipped' | string }
 
 function priceOf(model: string | null): [number, number, number] | null {
   const m = (model ?? '').toLowerCase().replace(/[\s.]+/g, '-')
@@ -134,6 +195,8 @@ export function resetForClear(s: State) {
   s.coldWritePending = false
   s.blocked = null
   s.misses = []
+  s.local = undefined
+  s.lastStop = null
   disarm(s)
 }
 
@@ -199,6 +262,7 @@ async function prune($: EngineInterface, s: State, now: number) {
 }
 
 async function stop($: EngineInterface, s: State, why: string | null, forgetAlways = false) {
+  const now = await $.clock.now()
   s.deadline = 0
   s.every = PING_AFTER_MS
   s.stopped = why
@@ -209,7 +273,180 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
     s.always = false
     await $.store.delete(KEY_ALWAYS)
   }
-  updateStatus($, s, await $.clock.now())
+  // A loop that stopped itself keeps its reason for a later status, even after a restart; one turned off or run out leaves nothing.
+  if (why) {
+    s.lastStop = { at: now, why }
+    await save($, s, { stop: s.lastStop })
+  } else {
+    await $.store.delete(recKey(s.sid))
+  }
+  updateStatus($, s, now)
+}
+
+function recKey(sid: string): string {
+  return `${KEY_REC}:${sid}`
+}
+
+function asRec(v: unknown): Rec | null {
+  if (!v || typeof v !== 'object') return null
+  const r = v as Rec
+  return typeof r.deadline === 'number' && typeof r.warmAt === 'number' && typeof r.at === 'number' ? r : null
+}
+
+/** Writes this session's record; a store failure must never break a turn, a ping or the end. */
+async function save($: EngineInterface, s: State, extra: Partial<Rec> = {}) {
+  if (!s.sid) return
+  try {
+    const rec: Rec = {
+      at: await $.clock.now(), warmAt: s.lastRequestAt, ctx: s.ctx, model: s.lastModel, cwd: s.cwd, title: s.title,
+      local: s.local ?? null, version: s.version, deadline: s.deadline, every: s.every, ...extra,
+    }
+    await $.store.set(recKey(s.sid), rec)
+  } catch {
+    // The record only serves a report after a quit.
+  }
+}
+
+type DesktopRow = { local: string; title: string | null; isArchived: boolean }
+
+/** Claude Desktop keeps one file per session naming its own id beside the CLI's; outside the desktop there is none. */
+async function desktopRow($: EngineInterface, sid: string): Promise<DesktopRow | null> {
+  try {
+    const home = await $.env.get('HOME')
+    if (!home || !sid) return null
+    const { exitCode, stdout } = await $.process.run([
+      '/bin/sh', '-c', 'f=$(grep -rlF --include="local_*.json" "$1" "$2" 2>/dev/null | head -1); [ -n "$f" ] && cat "$f"',
+      'cache-tax-lookup', sid, `${home}/${DESKTOP_SESSIONS}`,
+    ], { timeoutMs: 5000 })
+    if (exitCode !== 0 || !stdout) return null
+    const row = JSON.parse(stdout) as { sessionId?: unknown; cliSessionId?: unknown; title?: unknown; isArchived?: unknown }
+    if (row.cliSessionId !== sid || typeof row.sessionId !== 'string') return null
+    return { local: row.sessionId, title: typeof row.title === 'string' && row.title ? row.title : null, isArchived: row.isArchived === true }
+  } catch {
+    return null
+  }
+}
+
+/** Once per process: the desktop id that a claude:// link and a peer message need, and the title the sidebar shows. */
+async function lookupDesktop($: EngineInterface, s: State) {
+  if (s.local !== undefined) return
+  const row = await desktopRow($, s.sid)
+  s.local = row?.local ?? null
+  if (row?.title) s.title = row.title
+}
+
+/**
+ * Leaves a detached watcher behind a session that Claude is shutting down with its cache still warm.
+ * If the whole app comes back before the cache goes cold and nothing has started, it opens this
+ * session, whose start then revives the others by message.
+ */
+async function watchForRelaunch($: EngineInterface, s: State, now: number) {
+  const until = s.lastRequestAt + TTL_MS - REVIVE_MARGIN_MS
+  if (!s.local || s.compacted || until - now < 5 * 60 * 1000) return
+  const home = await $.env.get('HOME')
+  if (!home) return
+  await $.process.run([
+    '/usr/bin/perl', '-MPOSIX', '-e', DETACH, WATCH_SCRIPT,
+    String(Math.floor(until / 1000)), `claude://code/continue?session=${s.local}`, `${home}/${WATCH_LOCK}`,
+  ], { timeoutMs: 1000 })
+}
+
+/**
+ * Run by the first session to start after Claude quit: every other session that was shut down with a
+ * live window is either revived (its cache still warm, same Claude Code version, still in the sidebar)
+ * or listed with the price of reopening it.
+ */
+async function reviveOthers($: EngineInterface, s: State) {
+  try {
+    const now = await $.clock.now()
+    const rows: ReviveRow[] = []
+    for (const key of await $.store.keys()) {
+      if (!key.startsWith(KEY_REC + ':')) continue
+      const sid = key.slice(KEY_REC.length + 1)
+      if (sid === s.sid) continue
+      const rec = asRec(await $.store.get(key))
+      if (!rec) continue
+      if (now - rec.at > RECORD_KEEP_MS) {
+        await $.store.delete(key)
+        continue
+      }
+      // Only a session shut down under it, not one left by choice, and each shutdown once.
+      if (!rec.endedAt || !(rec.endReason === 'other' || (rec.local && rec.endReason === 'prompt_input_exit'))) continue
+      if (rec.deadline <= now || (rec.handledAt ?? 0) >= rec.endedAt) continue
+      await $.store.set(key, { ...rec, handledAt: now })
+      const row = rec.local ? await desktopRow($, sid) : null
+      if (row?.isArchived) continue
+      const warmLeft = rec.warmAt + TTL_MS - now
+      let revived: ReviveRow['revived'] = 'skipped'
+      // A new Claude Code version builds a different prompt prefix, so its ping would re-write the whole context.
+      if (warmLeft > REVIVE_MARGIN_MS && (!rec.version || !s.version || rec.version === s.version)) {
+        try {
+          const sent = await $.session.send({ to: rec.local ?? { sessionId: sid }, text: REVIVE_TEXT })
+          revived = sent.isDelivered ? 'sent' : sent.reason
+        } catch (err) {
+          revived = err instanceof Error ? err.message : String(err)
+        }
+      }
+      rows.push({ sid, rec: { ...rec, title: row?.title ?? rec.title }, warmLeft, revived })
+    }
+    if (rows.length) await report($, s, rows, now)
+  } catch {
+    // A report that fails must not disturb the session that happened to start first.
+  }
+}
+
+function reviveLine(s: State, now: number): string {
+  if (!s.deadline || !s.lastRequestAt || isCold(s, now)) return 'restarted after Claude came back, but the cache had already gone cold; keepwarm waits for the next turn'
+  return `restarted after Claude came back with ${fmtDuration(s.lastRequestAt + TTL_MS - now)} of warm cache left; keepwarm carries on and no turn was run`
+}
+
+function when(ms: number): string {
+  return new Date(ms).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+}
+
+export function reportText(rows: ReviveRow[], now: number, version: string | null): { title: string; body: string; summary: string } {
+  const quitAt = Math.min(...rows.map(r => r.rec.endedAt ?? now))
+  const lines = [`Claude quit at ${when(quitAt)} and was back at ${when(now)}. These sessions had /keepwarm on when it quit.`, '']
+  for (const r of rows) {
+    const name = r.rec.title ?? (r.rec.cwd ? r.rec.cwd.split('/').filter(Boolean).pop() : null) ?? r.sid.slice(0, 8)
+    const price = priceOf(r.rec.model)
+    const reopen = `reopening it re-writes ${r.rec.ctx.toLocaleString('en-US')} tokens, about ${fmtUsd(price ? r.rec.ctx * price[1] / 1e6 : null)}`
+    const what = r.revived === 'sent' ? `restarted automatically with ${fmtDuration(r.warmLeft)} of warm cache left; keepwarm carries on there`
+      : r.warmLeft <= REVIVE_MARGIN_MS ? `cold since ${when(r.rec.warmAt + TTL_MS)}; ${reopen}`
+      : r.revived === 'skipped' ? `not restarted, because Claude Code changed from ${r.rec.version} to ${version} and the old cache no longer matches; ${reopen}`
+      : `could not be restarted (${r.revived}); its cache stays warm until ${when(r.rec.warmAt + TTL_MS)}, then ${reopen}`
+    const link = r.rec.local ? ` [Open](claude://code/continue?session=${r.rec.local})` : ''
+    lines.push(`- **${name}**: ${what}.${link}`)
+  }
+  const sent = rows.filter(r => r.revived === 'sent').length
+  const summary = `${rows.length} keepwarm session${rows.length === 1 ? ' was' : 's were'} shut down when Claude quit; ` +
+    (sent ? `${sent} restarted while still warm` : 'none was still warm') + (rows.length - sent ? `, ${rows.length - sent} left for you to reopen` : '')
+  return { title: `Keepwarm sessions after Claude quit, ${when(now)}`, body: lines.join('\n'), summary }
+}
+
+/** One Bear note per return, a file when Bear is not there, a line in this session and a desktop notification. */
+async function report($: EngineInterface, s: State, rows: ReviveRow[], now: number) {
+  const { title, body, summary } = reportText(rows, now, s.version)
+  let where = 'Bear'
+  try {
+    // bearcli reads \n and \\ as escapes in --content.
+    const made = await $.process.run([BEAR_CLI, 'create', title, '--content', body.replace(/\\/g, '\\\\'), '--tags', REPORT_TAG], { timeoutMs: 15000 })
+    if (made.exitCode !== 0) throw new Error(made.stderr)
+  } catch {
+    const home = await $.env.get('HOME')
+    where = `${home ?? '~'}/.claude/cache-tax-report.md`
+    try {
+      await $.fs.write(where, `# ${title}\n\n${body}\n`)
+    } catch {
+      where = 'nowhere, the note and the file both failed'
+    }
+  }
+  $.ui.log(`${summary}. Details in ${where === 'Bear' ? `Bear, "${title}"` : where}.`)
+  try {
+    await $.process.run(['/usr/bin/osascript', '-e', 'on run argv\ndisplay notification (item 1 of argv) with title "cache-tax"\nend run', summary], { timeoutMs: 5000 })
+  } catch {
+    // The note and the log line already carry it.
+  }
 }
 
 async function arm($: EngineInterface, s: State) {
@@ -258,8 +495,9 @@ async function ping($: EngineInterface, s: State) {
   s.last = { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens, usd, warm }
   if (!warm) return stop($, s, `the ping read ${fmtTok(u.cache_read_input_tokens)} and wrote ${fmtTok(u.cache_creation_input_tokens)} tokens (${fmtUsd(usd)}), the cache was already gone`)
   s.lastRequestAt = now
+  await save($, s)
   try {
-    await $.state.set(LAST_PING, { at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens })
+    await $.state.set(LAST_PING,{ at: now, read: u.cache_read_input_tokens, write: u.cache_creation_input_tokens })
   } catch {
     // A display that misses one ping is harmless; the warming loop must not stop over it.
   }
@@ -280,6 +518,8 @@ async function startWindow($: EngineInterface, s: State, windowMs: number, every
   s.deadline = now + windowMs
   s.stopped = null
   await $.store.set(deadlineKey(s), s.deadline)
+  await lookupDesktop($, s)
+  await save($, s)
   await arm($, s)
 }
 
@@ -295,6 +535,7 @@ function card(s: State, now: number): string {
   const always = s.always ? ' (always)' : ''
   const idle = s.always ? 'off until the next turn, which arms 6h00m (always)' : 'off (/keepwarm to arm it for 6h00m)'
   lines.push(`keepwarm    ${s.deadline ? (statusText(s, now) ?? '').replace(/^keepwarm /, 'on, ') + always : s.stopped ? `stopped, ${s.stopped}${always}` : idle}`)
+  if (s.lastStop && s.lastStop.why !== s.stopped) lines.push(`last stop   ${when(s.lastStop.at)}, ${s.lastStop.why}`)
   const pings = breakEvenPings(s)
   if (pings != null) lines.push(`break-even  up to ${pings} pings at the read rate cost one cold write, about ${fmtDuration(pings * s.every)} of idle at one ping per ${fmtDuration(s.every)}`)
   lines.push(`guard       ${s.guard === 'refuse' ? 'refuse once (/cache-tax guard warn to only show the price)' : 'warn only (/cache-tax guard refuse to be stopped once)'}`)
@@ -332,6 +573,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, blocked: null, misses: [], pending: null, last: null, stopped: null,
+    cwd: null, title: null, local: undefined, version: null, lastStop: null,
   }
 }
 
@@ -395,6 +637,18 @@ export const register: Register = on => {
       $.ui.status(undefined)
     }
     s.sid = await $.session.id()
+    s.cwd = typeof e.cwd === 'string' ? e.cwd : null
+    try {
+      s.version = (await $.session.version()).version
+    } catch {
+      s.version = null
+    }
+    const own = asRec(await $.store.get(recKey(s.sid)))
+    if (own) {
+      s.lastStop = own.stop ?? null
+      s.title = own.title
+      if (own.local) s.local = own.local
+    }
     const now = await $.clock.now()
     await prune($, s, now)
     const saved = await $.store.get(deadlineKey(s))
@@ -426,6 +680,8 @@ export const register: Register = on => {
       $.ui.log('the hook form (cache-tax@claude-code-hooks) is also installed, so a cold send is warned about or refused twice. Uninstall it, or /cache-tax guard warn here.')
     }
     updateStatus($, s, now)
+    // Off the start's own path: the first session back after a quit revives or reports the rest.
+    $.clock.after(3000, () => { void reviveOthers($, s) })
     return r
   })
 
@@ -440,7 +696,21 @@ export const register: Register = on => {
       updateStatus($, s, await $.clock.now())
       return r
     }
-    const line = seedFromResume(s, e, await $.clock.now())
+    const now = await $.clock.now()
+    let line = seedFromResume(s, e, now)
+    if (!s.title && typeof e.session_title === 'string' && e.session_title) s.title = e.session_title
+    if (e.source === 'resume') {
+      // The payload dates the last reply, not the last ping; this session's own record knows when the cache was last touched.
+      const own = asRec(await $.store.get(recKey(s.sid)))
+      if (own && own.warmAt > s.lastRequestAt) {
+        s.lastRequestAt = own.warmAt
+        if (!s.ctx) s.ctx = own.ctx
+        if (!s.lastModel) s.lastModel = own.model
+        if (!isCold(s, now)) line = null
+      }
+      // Back up again: the record must no longer read as shut down.
+      if (own?.endedAt && s.deadline) await save($, s)
+    }
     // The resume payload may omit the model; without it the guard cannot price the cold write.
     if (!s.lastModel) s.lastModel = await $.session.model()
     if (line) $.ui.log(line)
@@ -496,18 +766,30 @@ export const register: Register = on => {
     return { text: card(s, now) }
   })
 
+  // A revive that came as a peer delivery: the process restart was the point, so nothing is queued.
+  on('session.receive', async ($, e, next) => {
+    if (!e.text.includes(REVIVE_MARK)) return next(e)
+    $.ui.log(reviveLine(s, await $.clock.now()))
+    return { consumed: 'cache-tax revive' }
+  })
+
   // The message that pays. Only its first character is read.
   on('prompt.submit', async ($, e, next) => {
     if (e.origin.kind === 'plugin') return next(e)
     if (typeof e.text !== 'string' || e.text.trimStart().startsWith('/')) return next(e)
     const now = await $.clock.now()
+    // Nobody is there to resend a refused peer message or trigger, so those are priced, never dropped.
+    const automated = !HUMAN_ORIGINS.has(e.origin.kind) || ENVELOPE.test(e.text)
+    // A revive Claude Desktop handed in as a turn: the restart already re-armed keepwarm, a turn would only spend.
+    if (automated && e.text.includes(REVIVE_MARK)) return { drop: `cache-tax: ${reviveLine(s, now)}` }
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) {
       clearBlocked($, s)
       return next(e)
     }
-    if (s.guard === 'warn') {
+    if (s.guard === 'warn' || automated) {
       clearBlocked($, s)
-      $.ui.log(`${guardText(s, now)} Sending anyway; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
+      const who = s.guard === 'warn' ? 'Sending anyway' : 'It came from another session or a trigger, so it goes through'
+      $.ui.log(`${guardText(s, now)} ${who}; keepwarm will hold the cache for ${fmtDuration(AUTO_WARM_MS)} once it lands.`)
       s.coldWritePending = true
       return next(e)
     }
@@ -566,8 +848,26 @@ export const register: Register = on => {
       }
     }
     s.coldWritePending = false
+    if (s.deadline) {
+      await lookupDesktop($, s)
+      await save($, s)
+    }
     await arm($, s)
     return r
+  })
+
+  // Shut down under a live window: leave the record the next session reports from, and a watcher for a quick relaunch.
+  on('session.end', async ($, e, next) => {
+    try {
+      if (e.reason !== 'clear' && s.deadline) {
+        const now = await $.clock.now()
+        await save($, s, { endedAt: now, endReason: e.reason })
+        if (e.reason === 'other' || e.reason === 'prompt_input_exit') await watchForRelaunch($, s, now)
+      }
+    } catch {
+      // The end has a short budget; a missing record only means no report.
+    }
+    return next(e)
   })
 
   on('session.compact', async ($, e, next) => {
