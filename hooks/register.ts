@@ -658,8 +658,8 @@ export const register: Register = on => {
     s.every = typeof savedEvery === 'number' && savedEvery >= MIN_PING_MS ? savedEvery : PING_AFTER_MS
     s.guard = savedGuard === 'warn' ? 'warn' : 'refuse'
     s.always = (await $.store.get(KEY_ALWAYS)) === true
-    // Always means a fresh default window every session, whatever the last one left behind.
-    if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+    // Always means at least a fresh default window every session; a longer one this session set for itself is kept.
+    if (s.always && s.deadline < now + DEFAULT_WINDOW_MS) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
     const usage = await $.session.usage()
     if (usage.context.tokens) s.ctx = usage.context.tokens
     await $.command.register({

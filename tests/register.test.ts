@@ -635,6 +635,15 @@ describe('keepwarm', () => {
     expect(w.status.at(-1)).toBe(undefined)
   })
 
+  test('always at start keeps a longer window the session set for itself', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true], ['deadline:S1', START + 40 * HOUR]])
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    expect(store.get('deadline:S1')).toBe(START + 40 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 40h00m left · waiting for the first turn')
+  })
+
   test('/keepwarm always sets the switch and arms now', async ($, on) => {
     mock.clock(on, { now: START })
     const store = new Map<string, unknown>()
