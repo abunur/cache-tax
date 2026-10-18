@@ -679,6 +679,26 @@ describe('keepwarm', () => {
     expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
   })
 
+  test('/keepwarm always keeps a longer window, lengthens a shorter one, and puts the period back to 50m', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '48h every 2m'))
+    await clock.advance(MIN)
+    const long = await $.command.run(run('keepwarm', 'always'))
+    expect(long.text).toMatch(/^keepwarm always on: every session stays warm until 6h00m after its last turn, and this one keeps its 47h59m window; \/keepwarm off turns it off for good$/)
+    expect(store.get('deadline:S1')).toBe(START + 48 * HOUR)
+    expect(store.has('every:S1')).toBe(false)
+    expect(w.status.at(-1)).toBe('keepwarm 47h59m left · waiting for the first turn')
+    await $.command.run(run('keepwarm', '2h every 2m'))
+    await clock.advance(MIN)
+    const short = await $.command.run(run('keepwarm', 'always'))
+    expect(short.text).toBe('keepwarm always on: every session stays warm until 6h00m after its last turn; /keepwarm off turns it off for good')
+    expect(store.get('deadline:S1')).toBe(START + 2 * MIN + 6 * HOUR)
+    expect(store.has('every:S1')).toBe(false)
+  })
+
   test('always rolls the window forward with each turn, so a long session never outlives it', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const store = new Map<string, unknown>([['always', true]])
@@ -1035,6 +1055,29 @@ describe('restart after a quit', () => {
     await clock.advance(3000)
     expect(w.sent).toEqual([])
     expect(w.runs.some(a => a[0].endsWith('bearcli'))).toBe(false)
+  })
+
+  test('a session shut down before any turn reached its cache is neither revived nor reported', async ($, on) => {
+    const clock = mock.clock(on, { now: START + 10 * MIN })
+    // With always on, a session that starts and quits before its first turn leaves a record with no cache clock.
+    const store = new Map<string, unknown>([['rec:fresh', rec({ local: 'local_f', title: 'Fresh', warmAt: 0, ctx: 0 })]])
+    const run = (argv: readonly string[]) => argv[0]?.endsWith('bearcli') ? { exitCode: 0 } : undefined
+    const w = world(on, [], { store, sid: 'mine', home: '/Users/me', run })
+    await $.session.start(session)
+    await clock.advance(3000)
+    expect(w.sent).toEqual([])
+    expect(w.runs.some(a => a[0].endsWith('bearcli'))).toBe(false)
+    expect(w.logs.some(l => /shut down when Claude quit/.test(l))).toBe(false)
+    // Beside a warm one, the warm one alone is revived and reported.
+    store.set('rec:warm', rec({ at: START + 10 * MIN, warmAt: START + 5 * MIN, endedAt: START + 10 * MIN }))
+    await $.session.start(session)
+    await clock.advance(3000)
+    expect(w.sent.map(m => m.to)).toEqual(['local_r'])
+    const body = w.runs.find(a => a[0].endsWith('bearcli'))![4]
+    expect(body).toMatch(/\*\*Recap\*\*: restarted automatically/)
+    expect(body).not.toMatch(/Fresh|local_f/)
+    expect(w.logs.at(-1)).toMatch(/^1 keepwarm session was shut down when Claude quit; 1 restarted while still warm\. Details in Bear/)
+    expect((store.get('rec:fresh') as Rec).handledAt).toBe(undefined)
   })
 
   test('without Bear the report goes to a file', async ($, on) => {

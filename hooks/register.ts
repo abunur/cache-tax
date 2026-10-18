@@ -425,6 +425,8 @@ async function reviveOthers($: EngineInterface, s: State) {
         await $.store.delete(key)
         continue
       }
+      // No cache clock: the session ended before any turn reached its cache, so there is nothing to revive or price.
+      if (!rec.warmAt) continue
       // Only a session shut down under it, not one left by choice, and each shutdown once.
       if (!rec.endedAt || !(rec.endReason === 'other' || (rec.local && rec.endReason === 'prompt_input_exit'))) continue
       if (rec.deadline <= now || (rec.handledAt ?? 0) >= rec.endedAt) continue
@@ -860,9 +862,12 @@ export const register: Register = on => {
     if (words[0] === 'always') {
       s.always = true
       await $.store.set(KEY_ALWAYS, true)
-      await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
+      // As at each turn's roll: a longer window the user set keeps its deadline, and the period goes back to the default.
+      const windowMs = Math.max(DEFAULT_WINDOW_MS, s.deadline - now)
+      await startWindow($, s, windowMs, PING_AFTER_MS)
+      const kept = windowMs > DEFAULT_WINDOW_MS && s.deadline ? `, and this one keeps its ${fmtDuration(s.deadline - now)} window` : ''
       const cold = isCold(s, now) ? `. The cache is cold now, so the first ping comes ${fmtDuration(s.every)} after the next turn` : ''
-      return { text: `keepwarm always on: every session stays warm until ${fmtDuration(DEFAULT_WINDOW_MS)} after its last turn; /keepwarm off turns it off for good${cold}` }
+      return { text: `keepwarm always on: every session stays warm until ${fmtDuration(DEFAULT_WINDOW_MS)} after its last turn${kept}; /keepwarm off turns it off for good${cold}` }
     }
     if (!words.length) {
       await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
