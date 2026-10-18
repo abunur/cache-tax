@@ -1516,3 +1516,82 @@ describe('/clear overlapping /keepwarm', () => {
     expect(w.forks.length).toBe(1)
   })
 })
+
+describe('always covers any break up to six hours', () => {
+  const alwaysOn = () => new Map<string, unknown>([['always', true]])
+
+  test('a window that stopped comes back on the next turn', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    const w = world(on, [{ read: 0, write: 200000 }, warm], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.status.at(-1)).toMatch(/^keepwarm stopped: the ping read 0/)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 50 * MIN + 6 * HOUR)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+  })
+
+  test('a shorter window and a testing period give way to six hours at 50m on the next turn', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    const w = world(on, [warm], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '90m every 2m'))
+    expect(store.get('every:S1')).toBe(2 * MIN)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 6 * HOUR)
+    expect(store.has('every:S1')).toBe(false)
+    await clock.advance(49 * MIN)
+    expect(w.forks.length).toBe(0)
+    await clock.advance(MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('an expired window with a testing period rolls at 50m, not at its old period', async ($, on) => {
+    let now = START
+    on('clock.now', () => ({ value: now }))
+    on('clock.after', () => new Promise<{ value: void }>(() => {}))
+    const store = alwaysOn()
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '90m every 1m'))
+    now += 91 * MIN
+    await $.turn.complete(turn())
+    expect(store.has('every:S1')).toBe(false)
+    expect(store.get('deadline:S1')).toBe(now + 6 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · ping in 50m')
+  })
+
+  test('the window rolls in the conversation after /clear too', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    let sid = 'S1'
+    world(on, [], { store, sid: () => sid })
+    await $.session.start(session)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    await clock.advance(5 * HOUR)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S2')).toBe(START + 11 * HOUR)
+  })
+
+  test('without always a turn never moves the deadline', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '90m'))
+    await clock.advance(80 * MIN)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 90 * MIN)
+    await clock.advance(10 * MIN)
+    expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    expect(w.forks.length).toBe(0)
+  })
+})

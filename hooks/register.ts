@@ -585,12 +585,6 @@ export const register: Register = on => {
     const r = await next(e)
     if (e.agentId) return r
     const now = await $.clock.now()
-    // Always is a rolling window: each main-session turn pushes the deadline to six hours past it.
-    if (s.always && s.deadline < now + DEFAULT_WINDOW_MS) {
-      s.deadline = now + DEFAULT_WINDOW_MS
-      s.stopped = null
-      await $.store.set(deadlineKey(s), s.deadline)
-    }
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
@@ -599,6 +593,9 @@ export const register: Register = on => {
     s.compacted = false
     s.waitForTurn = false
     s.ackedAt = 0
+    // Always covers any break up to six hours: each turn opens a fresh six-hour window at the default period,
+    // which also brings back a stopped window and replaces a shorter one or a testing period.
+    if (s.always) await startWindow($, s, DEFAULT_WINDOW_MS, PING_AFTER_MS)
     const u = e.usage
     if (u) {
       if (u.model) s.lastModel = u.model
