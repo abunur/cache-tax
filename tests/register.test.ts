@@ -38,12 +38,26 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 // replies from a script so each test decides what the cache looked like.
 type RunAnswer = { exitCode: number; stdout?: string; stderr?: string }
 
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[]; home?: string; version?: string; run?: (argv: readonly string[]) => RunAnswer | undefined; sendFails?: string } = {}) {
-  if (opts.store) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[]; home?: string; version?: string; run?: (argv: readonly string[]) => RunAnswer | undefined; sendFails?: string; storeGate?: (op: 'set' | 'delete', key: string) => Promise<void>; fifo?: boolean; storeLog?: string[] } = {}) {
+  if (opts.store && opts.fifo) {
+    // As the engine runs them: each $.store call of one plugin, a get included, waits until the one before it has finished.
+    const store = opts.store
+    const log = opts.storeLog
+    let chain: Promise<unknown> = Promise.resolve()
+    const queue = <T,>(f: () => Promise<T>): Promise<T> => {
+      const next = chain.then(f, f)
+      chain = next.catch(() => undefined)
+      return next
+    }
+    on('store.get', ($, e) => queue(async () => { log?.push(`get ${e.key}`); return { value: store.get(e.key) } }))
+    on('store.set', ($, e) => queue(async () => { await opts.storeGate?.('set', e.key); log?.push(`set ${e.key}`); store.set(e.key, e.value); return { value: undefined } }))
+    on('store.delete', ($, e) => queue(async () => { await opts.storeGate?.('delete', e.key); log?.push(`delete ${e.key}`); store.delete(e.key); return { value: undefined } }))
+    on('store.keys', () => queue(async () => ({ value: [...store.keys()] })))
+  } else if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
-    on('store.set', ($, e) => { store.set(e.key, e.value); return { value: undefined } })
-    on('store.delete', ($, e) => { store.delete(e.key); return { value: undefined } })
+    on('store.set', async ($, e) => { await opts.storeGate?.('set', e.key); store.set(e.key, e.value); return { value: undefined } })
+    on('store.delete', async ($, e) => { await opts.storeGate?.('delete', e.key); store.delete(e.key); return { value: undefined } })
     on('store.keys', () => ({ value: [...store.keys()] }))
   } else mock.store(on, {})
   const reads = { theme: 0, env: 0 }
@@ -1827,5 +1841,266 @@ describe('fork features on the 2.2.2 loop', () => {
     await $.classic.SessionStart({ source: 'clear' })
     expect(store.has('rec:S1')).toBe(false)
     expect((store.get('rec:S2') as Rec).deadline).toBe(START + 6 * HOUR)
+  })
+})
+
+describe('always covers any break up to six hours', () => {
+  const alwaysOn = () => new Map<string, unknown>([['always', true]])
+
+  test('a window that stopped comes back on the next turn', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    const w = world(on, [{ read: 0, write: 200000 }, warm], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.status.at(-1)).toMatch(/^keepwarm stopped: the ping read 0/)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 50 * MIN + 6 * HOUR)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+  })
+
+  test('a shorter window and a testing period give way to six hours at 50m on the next turn', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    const w = world(on, [warm], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '90m every 2m'))
+    expect(store.get('every:S1')).toBe(2 * MIN)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 6 * HOUR)
+    expect(store.has('every:S1')).toBe(false)
+    await clock.advance(49 * MIN)
+    expect(w.forks.length).toBe(0)
+    await clock.advance(MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('an expired window with a testing period rolls at 50m, not at its old period', async ($, on) => {
+    let now = START
+    on('clock.now', () => ({ value: now }))
+    on('clock.after', () => new Promise<{ value: void }>(() => {}))
+    const store = alwaysOn()
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '90m every 1m'))
+    now += 91 * MIN
+    await $.turn.complete(turn())
+    expect(store.has('every:S1')).toBe(false)
+    expect(store.get('deadline:S1')).toBe(now + 6 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · ping in 50m')
+  })
+
+  test('the window rolls in the conversation after /clear too', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    let sid = 'S1'
+    world(on, [], { store, sid: () => sid })
+    await $.session.start(session)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    await clock.advance(5 * HOUR)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S2')).toBe(START + 11 * HOUR)
+  })
+
+  test('without always a turn never moves the deadline', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '90m'))
+    await clock.advance(80 * MIN)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 90 * MIN)
+    await clock.advance(10 * MIN)
+    expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    expect(w.forks.length).toBe(0)
+  })
+
+  // This fork's roll: a longer window the user set outlasts the turns that roll it, and a turn that never
+  // reached the cache rolls nothing.
+  test('a 48h window survives a turn five hours later', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    const w = world(on, Array<ForkAnswer>(12).fill(warm), { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '48h'))
+    expect(store.get('deadline:S1')).toBe(START + 48 * HOUR)
+    await clock.advance(5 * HOUR)
+    expect(w.forks.length).toBe(6)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 48 * HOUR)
+    expect((store.get('rec:S1') as Rec).deadline).toBe(START + 48 * HOUR)
+    expect(w.status.at(-1)).toMatch(/^keepwarm 43h00m left · ping in 50m/)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(7)
+  })
+
+  test('a 48h window with a testing period keeps its deadline and drops the period on the next turn', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    const w = world(on, [warm], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '48h every 2m'))
+    expect(store.get('every:S1')).toBe(2 * MIN)
+    await clock.advance(MIN)
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 48 * HOUR)
+    expect(store.has('every:S1')).toBe(false)
+    expect((store.get('rec:S1') as Rec).every).toBe(50 * MIN)
+    await clock.advance(49 * MIN)
+    expect(w.forks.length).toBe(0)
+    await clock.advance(MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('an error turn with no usage after the window ran out does not reopen it or ping', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = alwaysOn()
+    const w = world(on, Array<ForkAnswer>(12).fill(warm), { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    // Pings at 50m through 5h50m, then the window ends six hours after the turn.
+    await clock.advance(7 * HOUR)
+    expect(w.forks.length).toBe(7)
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.has('rec:S1')).toBe(false)
+    // Retries exhausted: the API answered nothing, so no cache was read or written.
+    await $.turn.complete(turn({ reason: 'error', answer: '', usage: undefined }))
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.has('rec:S1')).toBe(false)
+    expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    await clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(7)
+    // The next turn that reaches the cache opens the window again.
+    await $.turn.complete(turn())
+    expect(store.get('deadline:S1')).toBe(START + 15 * HOUR)
+  })
+})
+
+describe('/keepwarm off during a rolling turn', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('off wins over the window a finishing turn was opening', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    let holdEveryDelete = false
+    let release = () => {}
+    const storeGate = async (op: 'set' | 'delete', key: string) => {
+      if (holdEveryDelete && op === 'delete' && key === 'every:S1') {
+        holdEveryDelete = false
+        await new Promise<void>(r => { release = r })
+      }
+    }
+    const w = world(on, [warm, warm], { store, storeGate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    // The next turn's roll pauses while saving its window; /keepwarm off runs to the end meanwhile.
+    holdEveryDelete = true
+    const finishing = $.turn.complete(turn())
+    await settle()
+    expect((await $.command.run(run('keepwarm', 'off'))).text).toMatch(/^keepwarm is off/)
+    release()
+    await finishing
+    await settle()
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.has('always')).toBe(false)
+    expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    await clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(0)
+  })
+
+  // The clock reads of a rolling turn, in order, on a store that runs one call at a time as the engine does. The
+  // second is the roll's own read; the rest cover this fork's record, which the roll and the end of the turn both
+  // save, and which must stay deleted once off has run.
+  const reads = ['the turn', 'the roll', "the roll's arm", "the roll's record", "the turn's record", "the turn's arm"]
+  for (const [k, what] of reads.entries()) {
+    test(`off that lands while ${what} reads the clock leaves no window, switch or record behind`, async ($, on) => {
+      // mock.clock, with one read that can be held: the k-th $.clock.now() after holdAt is set.
+      let now = START
+      let holdAt = -1
+      let seen = 0
+      let held = false
+      let release = () => {}
+      const due: Array<{ at: number; fire: () => void }> = []
+      on('clock.now', async () => {
+        if (holdAt >= 0 && seen++ === holdAt) {
+          held = true
+          await new Promise<void>(r => { release = r })
+        }
+        return { value: now }
+      })
+      on('clock.after', ($, e) => new Promise<{ value: void }>(r => { due.push({ at: now + e.ms, fire: () => r({ value: undefined }) }) }))
+      const advance = async (ms: number) => {
+        const end = now + ms
+        for (let next = due.sort((x, y) => x.at - y.at)[0]; next && next.at <= end; next = due.sort((x, y) => x.at - y.at)[0]) {
+          due.splice(due.indexOf(next), 1)
+          now = Math.max(now, next.at)
+          next.fire()
+          await settle()
+        }
+        now = end
+      }
+      const store = new Map<string, unknown>([['always', true]])
+      const log: string[] = []
+      const w = world(on, [warm, warm], { store, fifo: true, storeLog: log })
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      expect(store.has('rec:S1')).toBe(true)
+      await advance(10 * MIN)
+      holdAt = k
+      const finishing = $.turn.complete(turn())
+      await settle()
+      expect(held).toBe(true)
+      expect((await $.command.run(run('keepwarm', 'off'))).text).toBe('keepwarm is off, and no longer arms itself at session start')
+      expect(store.has('rec:S1')).toBe(false)
+      release()
+      await finishing
+      await settle()
+      expect(store.has('deadline:S1')).toBe(false)
+      expect(store.has('every:S1')).toBe(false)
+      expect(store.has('always')).toBe(false)
+      expect(store.has('rec:S1')).toBe(false)
+      expect(log.filter(op => op.endsWith(' rec:S1')).at(-1)).toBe('delete rec:S1')
+      expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+      await advance(2 * HOUR)
+      expect(w.forks.length).toBe(0)
+    })
+  }
+
+  test('off that lands while a failed ping is stopping the loop does not bring back its record', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>()
+    let hold = false
+    let release = () => {}
+    const storeGate = async (op: 'set' | 'delete', key: string) => {
+      if (hold && op === 'delete' && key === 'every:S1') {
+        hold = false
+        await new Promise<void>(r => { release = r })
+      }
+    }
+    world(on, [null], { store, storeGate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    expect(store.has('rec:S1')).toBe(true)
+    // The ping at 50m is not sent, so the loop stops itself, and pauses while deleting its window.
+    hold = true
+    await clock.advance(50 * MIN)
+    await settle()
+    expect(hold).toBe(false)
+    expect((await $.command.run(run('keepwarm', 'off'))).text).toBe('keepwarm is off')
+    expect(store.has('rec:S1')).toBe(false)
+    release()
+    await settle()
+    expect(store.has('rec:S1')).toBe(false)
   })
 })

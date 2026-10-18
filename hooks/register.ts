@@ -115,6 +115,7 @@ export type State = {
   retryReason: string
   gen: number
   tick: number
+  offs: number
   inFlight: boolean
   stepWrites: { usd: number; priced: boolean } | null
 }
@@ -305,6 +306,12 @@ async function prune($: EngineInterface, s: State, now: number) {
 }
 
 async function stop($: EngineInterface, s: State, why: string | null, forgetAlways = false) {
+  // Set before any await, so a window being opened at the same moment sees the off and does not write itself back.
+  if (forgetAlways) {
+    s.always = false
+    s.offs++
+  }
+  const offs = s.offs
   s.deadline = 0
   s.every = PING_AFTER_MS
   s.stopped = why
@@ -313,15 +320,13 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
-  if (forgetAlways) {
-    s.always = false
-    await $.store.delete(KEY_ALWAYS)
-  }
+  if (forgetAlways) await $.store.delete(KEY_ALWAYS)
   const now = await $.clock.now()
   // A loop that stopped itself keeps its reason for a later status, even after a restart; one turned off or run out leaves nothing.
   if (why) {
     s.lastStop = { at: now, why }
-    await save($, s, { stop: s.lastStop })
+    // An off that landed during the deletes above has already removed the record; the reason is not written back.
+    if (s.offs === offs) await save($, s, { stop: s.lastStop })
   } else {
     await $.store.delete(recKey(s.sid))
   }
@@ -341,9 +346,14 @@ function asRec(v: unknown): Rec | null {
 /** Writes this session's record; a store failure must never break a turn, a ping or the end. */
 async function save($: EngineInterface, s: State, extra: Partial<Rec> = {}) {
   if (!s.sid) return
+  const offs = s.offs
   try {
+    const at = await $.clock.now()
+    // A /keepwarm off before or during the clock read deleted the window and its record; writing now would bring
+    // the record back. Only a loop's own stop reason outlives its window. Nothing awaits from here to the write.
+    if (s.offs !== offs || (!s.deadline && !extra.stop)) return
     const rec: Rec = {
-      at: await $.clock.now(), warmAt: s.lastRequestAt, ctx: s.ctx, model: s.lastModel, cwd: s.cwd, title: s.title,
+      at, warmAt: s.lastRequestAt, ctx: s.ctx, model: s.lastModel, cwd: s.cwd, title: s.title,
       local: s.local ?? null, version: s.version, deadline: s.deadline, every: s.every, ...extra,
     }
     await $.store.set(recKey(s.sid), rec)
@@ -601,15 +611,30 @@ function armedText(s: State, now: number, windowMs: number): string {
 }
 
 async function startWindow($: EngineInterface, s: State, windowMs: number, every: number) {
+  // A /keepwarm off that lands while this awaits wins: the window it cancelled is not written back.
+  const offs = s.offs
   const now = await $.clock.now()
+  if (s.offs !== offs) return
+  const deadline = now + windowMs
   s.every = every
+  s.deadline = deadline
+  s.stopped = null
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
-  s.deadline = now + windowMs
-  s.stopped = null
-  await $.store.set(deadlineKey(s), s.deadline)
+  await $.store.set(deadlineKey(s), deadline)
+  if (s.offs !== offs) {
+    // Remove only what this call wrote; a window armed after the off is left alone.
+    if ((await $.store.get(deadlineKey(s))) === deadline) {
+      await $.store.delete(deadlineKey(s))
+      if (!s.deadline) await $.store.delete(everyKey(s))
+    }
+    return
+  }
   await arm($, s)
+  // An off during the arm took the window and its record with it; nothing below may write them back.
+  if (s.offs !== offs) return
   // Armed straight after the deadline is stored; the desktop lookup, a process run, and the record follow.
+  // save() itself skips the write if an off lands during the lookup.
   await lookupDesktop($, s)
   await save($, s)
 }
@@ -665,7 +690,7 @@ export function freshState(): State {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, blocked: null, misses: [], pending: null, last: null, stopped: null,
     cwd: null, title: null, local: undefined, version: null, lastStop: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, inFlight: false, stepWrites: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, inFlight: false, stepWrites: null,
   }
 }
 
@@ -929,12 +954,6 @@ export const register: Register = on => {
     const r = await next(e)
     if (e.agentId) return r
     const now = await $.clock.now()
-    // Always is a rolling window: each main-session turn pushes the deadline to six hours past it.
-    if (s.always && s.deadline < now + DEFAULT_WINDOW_MS) {
-      s.deadline = now + DEFAULT_WINDOW_MS
-      s.stopped = null
-      await $.store.set(deadlineKey(s), s.deadline)
-    }
     // A sleeping host may deliver this turn before the expired window's timer.
     if (s.deadline && now >= s.deadline) await stop($, s, null)
     // turn.step stamps the exact request time; when no step of this turn did, the turn's end is the floor.
@@ -943,6 +962,11 @@ export const register: Register = on => {
     s.compacted = false
     s.waitForTurn = false
     s.ackedAt = 0
+    // Always covers any break up to six hours: each turn that reached the cache opens a window of at least six hours
+    // at the default period, which brings back a stopped window, lengthens a shorter one and replaces a testing period.
+    // Unlike upstream, a longer window the user set (/keepwarm 48h) keeps its deadline, and a turn with no usage,
+    // which never reached the cache, rolls nothing.
+    if (s.always && e.usage) await startWindow($, s, Math.max(DEFAULT_WINDOW_MS, s.deadline - now), PING_AFTER_MS)
     const u = e.usage
     if (u) {
       if (u.model) s.lastModel = u.model
