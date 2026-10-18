@@ -442,7 +442,7 @@ async function reviveOthers($: EngineInterface, s: State) {
 
 function reviveLine(s: State, now: number): string {
   if (!s.deadline || !s.lastRequestAt || isCold(s, now)) return 'restarted after Claude came back, but the cache had already gone cold; keepwarm waits for the next turn'
-  return `restarted after Claude came back with ${fmtDuration(s.lastRequestAt + TTL_MS - now)} of warm cache left; keepwarm carries on and no turn was run`
+  return `restarted after Claude came back with ${fmtDuration(s.lastRequestAt + TTL_MS - now)} of warm cache left; the window is kept and no turn was run, and pings resume after the next turn here, since a new process has nothing to fork before one`
 }
 
 function when(ms: number): string {
@@ -456,7 +456,7 @@ export function reportText(rows: ReviveRow[], now: number, version: string | nul
     const name = r.rec.title ?? (r.rec.cwd ? r.rec.cwd.split('/').filter(Boolean).pop() : null) ?? r.sid.slice(0, 8)
     const price = priceOf(r.rec.model, r.rec.ctx)
     const reopen = `reopening it re-writes ${r.rec.ctx.toLocaleString('en-US')} tokens, about ${fmtUsd(price ? r.rec.ctx * price[1] / 1e6 : null)}`
-    const what = r.revived === 'sent' ? `restarted automatically with ${fmtDuration(r.warmLeft)} of warm cache left; keepwarm carries on there`
+    const what = r.revived === 'sent' ? `restarted automatically with ${fmtDuration(r.warmLeft)} of warm cache left; its window is kept and pings resume after its next turn, so one message there before ${when(r.rec.warmAt + TTL_MS)} keeps it warm`
       : r.warmLeft <= REVIVE_MARGIN_MS ? `cold since ${when(r.rec.warmAt + TTL_MS)}; ${reopen}`
       : r.revived === 'skipped' ? `not restarted, because Claude Code changed from ${r.rec.version} to ${version} and the old cache no longer matches; ${reopen}`
       : `could not be restarted (${r.revived}); its cache stays warm until ${when(r.rec.warmAt + TTL_MS)}, then ${reopen}`
@@ -673,6 +673,9 @@ export const register: Register = on => {
   const s = freshState()
   let light = false
   let noColor = false
+  // This session's record as session.start found it. Always re-arming there saves a new record before the
+  // resume handler runs, with no cache clock yet, so the resume reads this copy instead.
+  let startRec: { sid: string; rec: Rec } | null = null
 
   on('config.set', { key: 'theme' }, async ($, e, next) => {
     const result = await next(e)
@@ -736,6 +739,7 @@ export const register: Register = on => {
       s.version = null
     }
     const own = asRec(await $.store.get(recKey(s.sid)))
+    startRec = own ? { sid: s.sid, rec: own } : null
     if (own) {
       s.lastStop = own.stop ?? null
       s.title = own.title
@@ -780,6 +784,9 @@ export const register: Register = on => {
   // Resume fields seed the guard before any turn of the resumed session has run.
   on('classic.SessionStart', async ($, e, next) => {
     const r = await next(e)
+    // Only the first SessionStart after this process's session.start may use the record read there.
+    const fromStart = startRec && startRec.sid === s.sid ? startRec.rec : null
+    startRec = null
     // A resumed or cleared conversation is not the one a ping in flight was sent for.
     outdate(s)
     if (e.source === 'clear') {
@@ -799,7 +806,7 @@ export const register: Register = on => {
     if (!s.title && typeof e.session_title === 'string' && e.session_title) s.title = e.session_title
     if (e.source === 'resume') {
       // The payload dates the last reply, not the last ping; this session's own record knows when the cache was last touched.
-      const own = asRec(await $.store.get(recKey(s.sid)))
+      const own = fromStart ?? asRec(await $.store.get(recKey(s.sid)))
       if (own && own.warmAt > s.lastRequestAt) {
         s.lastRequestAt = own.warmAt
         if (!s.ctx) s.ctx = own.ctx
