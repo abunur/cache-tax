@@ -1,4 +1,5 @@
 import { describe, expect, mock, test, tier } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 import type { CommandRunInput, ConfigSetInput, ModelForkResult, On, PromptSubmitInput, RenderPropsOf, SessionStartInput, TurnCompleteInput, TurnUsage } from 'claude-code'
 
 import { statusIcons } from '../hooks/status-icons'
@@ -37,7 +38,7 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 // replies from a script so each test decides what the cache looked like.
 type RunAnswer = { exitCode: number; stdout?: string; stderr?: string }
 
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string; model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; home?: string; version?: string; run?: (argv: readonly string[]) => RunAnswer | undefined; sendFails?: string } = {}) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[]; home?: string; version?: string; run?: (argv: readonly string[]) => RunAnswer | undefined; sendFails?: string } = {}) {
   if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
@@ -61,12 +62,17 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   const logs: string[] = []
   const entered: string[] = []
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: opts.sid ?? 'S1' }))
+  on('session.id', () => ({ value: typeof opts.sid === 'function' ? opts.sid() : opts.sid ?? 'S1' }))
   on('session.model', () => ({ value: opts.model ?? 'claude-fable-5-1' }))
   on('session.usage', () => ({ value: { startedAt: START, context: { window: 1000000, tokens: opts.live?.tokens }, rateLimits: [] } }))
   on('command.register', ($, e) => ({ value: { command: e.name } }))
   on('command.list', () => ({ value: (opts.commands ?? []).map(name => ({ name, description: '', source: 'plugin' as const })) }))
   on('turn.complete', ($, e) => ({ text: e.answer }))
+  on('turn.step', async function* ($, e) {
+    const u = opts.steps?.shift() ?? null
+    yield { kind: 'stop' as const, stopReason: 'end_turn' as const, usage: u }
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: u }
+  })
   on('prompt.submit', ($, e) => { entered.push(e.text); return { text: e.text } })
   on('session.compact', ($, e) => ({ messages: e.messages }))
   on('classic.SessionStart', () => ({}))
@@ -89,8 +95,9 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
   on('session.version', () => ({ value: { version: opts.version ?? '2.1.299' } }))
   on('session.end', ($, e) => ({ sessionId: e.sessionId }))
   on('session.receive', ($, e) => ({ text: e.text }))
-  on('model.fork', () => {
+  on('model.fork', async () => {
     forks.push(forks.length)
+    if (opts.gate) await opts.gate()
     const a = forkAnswers.shift()
     // Older Claude Code releases returned null instead of a failure object.
     if (a === null || a === undefined) return { value: null as unknown as ModelForkResult }
@@ -102,6 +109,9 @@ function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, un
 }
 
 const warm: ForkAnswer = { read: 200000, write: 0 }
+// A ping that finds nothing to fork leaves the window waiting, with a wake at the cold mark and no further fork.
+const nothing: ForkAnswer = { isAnswered: false, reason: 'nothing-to-fork' }
+const busy: ForkAnswer = { isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage() }
 
 const bandProps: RenderPropsOf['AbovePrompt'] = {
   hasSurvey: false, isWorking: false, maxRows: 10, bodyColumns: 75,
@@ -152,9 +162,9 @@ describe('cache indicator', () => {
     test(`${surface}: official cube follows state and theme with a text alternative`, async ($, on) => {
       const clock = mock.clock(on, { now: 10 * HOUR })
       const theme = { value: 'dark' }
-      const w = world(on, [], { theme })
+      const w = world(on, [nothing], { theme })
       await $.session.start({ ...session, surface, isInteractive: true })
-      await $.command.run(run('keepwarm', '3h every 90m'))
+      await $.command.run(run('keepwarm', '3h'))
       const ui = await $.ui.mount({ plugin: 'cache-tax', surface, component: 'AbovePrompt', props: bandProps })
       const type = surface === 'terminal' ? 'Image' : 'Svg'
       const source = (variant: typeof statusIcons.dark) => surface === 'terminal' ? { png: variant.neutral.png } : variant.neutral.svg
@@ -170,7 +180,7 @@ describe('cache indicator', () => {
       await clock.advance(HOUR)
       expect((await ui.find({ type }))?.props.source).toEqual(surface === 'terminal' ? { png: statusIcons.light.cold.png } : statusIcons.light.cold.svg)
       expect((await ui.find({ type: 'Text', text: /^cold$/ }))?.props.color).toBe('#c15f3c')
-      expect(w.forks.length).toBe(0)
+      expect(w.forks.length).toBe(1)
       await $.command.run(run('keepwarm', 'off'))
       expect(await ui.find({ type })).toBe(undefined)
     })
@@ -192,21 +202,21 @@ describe('cache indicator', () => {
   for (const surface of ['terminal', 'desktop'] as const) {
     test(`${surface}: unknown, warm, cold and warm again agree with the card`, async ($, on) => {
       const clock = mock.clock(on, { now: 10 * HOUR })
-      const w = world(on, [], { bandText: 'other mod' })
+      const w = world(on, [nothing], { bandText: 'other mod' })
       await $.session.start({ ...session, surface, isInteractive: true })
       const ui = await $.ui.mount({ plugin: 'cache-tax', surface, component: 'AbovePrompt', props: bandProps })
       expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
-      await $.command.run(run('keepwarm', '3h every 90m'))
+      await $.command.run(run('keepwarm', '3h'))
       expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe(undefined)
       expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/unknown.*waiting for the first turn/)
       await $.turn.complete(turn())
       expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('success')
-      expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/warm.*ping in 1h30m/)
+      expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/warm.*ping in 50m/)
       await clock.advance(HOUR)
       expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('#d97757')
       expect((await ui.find({ type: 'Text', text: 'cache-tax' }))?.text).toMatch(/cold.*cold now/)
       expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/state       COLD/)
-      expect(w.forks.length).toBe(0)
+      expect(w.forks.length).toBe(1)
       expect((await ui.find({ text: /^other mod$/ }))?.text).toBe('other mod')
       await $.turn.complete(turn())
       expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('success')
@@ -214,7 +224,7 @@ describe('cache indicator', () => {
       expect(w.status.filter(Boolean)).toEqual([])
       await $.command.run(run('keepwarm', 'off'))
       expect(await ui.find({ text: 'cache-tax' })).toBe(undefined)
-      expect(w.forks.length).toBe(0)
+      expect(w.forks.length).toBe(1)
     })
   }
 
@@ -255,7 +265,7 @@ describe('cache indicator', () => {
 
   test('a warm resume restores green and ignores subagent cache activity', async ($, on) => {
     const clock = mock.clock(on, { now: 10 * HOUR })
-    const w = world(on, [], { store: new Map<string, unknown>([['deadline:S1', 13 * HOUR], ['every:S1', 90 * MIN]]) })
+    const w = world(on, [nothing], { store: new Map<string, unknown>([['deadline:S1', 13 * HOUR]]) })
     await $.session.start({ ...session, surface: 'terminal', isInteractive: true })
     await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 30 * 60, context_tokens: 200000 })
     const ui = await $.ui.mount({ plugin: 'cache-tax', surface: 'terminal', component: 'AbovePrompt', props: bandProps })
@@ -264,7 +274,7 @@ describe('cache indicator', () => {
     await $.session.compact({ trigger: 'manual', agentId: 'worker', messages: [{ role: 'user', text: 'summary', toolUses: [] }] })
     await clock.advance(30 * MIN)
     expect((await ui.find({ type: 'Text', text: /^(warm|cold|unknown|stopped)$/ }))?.props.color).toBe('#d97757')
-    expect(w.forks.length).toBe(0)
+    expect(w.forks.length).toBe(1)
   })
 
   for (const surface of ['vscode', 'mobile', null] as const) {
@@ -298,8 +308,7 @@ describe('cache indicator', () => {
   })
 
   for (const failure of [
-    { isAnswered: false, reason: 'nothing-to-fork' },
-    { isAnswered: false, reason: 'api-error', status: 429, error: 'rate_limit', usage: usage() },
+    { isAnswered: false, reason: 'api-error', status: 400, error: 'invalid_request', usage: usage() },
     { isAnswered: false, reason: 'empty-reply', usage: usage() },
     { isAnswered: false, reason: 'aborted', usage: usage() },
   ] satisfies ModelForkResult[]) {
@@ -926,12 +935,13 @@ describe('restart after a quit', () => {
     await clock.advance(3 * HOUR)
     const peer = await $.prompt.submit({ text: 'FYI from the other session', wait: false, origin: { kind: 'peer' } as PromptSubmitInput['origin'] })
     expect(peer.drop).toBe(undefined)
-    expect(w.logs.at(-1)).toMatch(/went cold .* It came from another session or a trigger, so it goes through/)
+    expect(w.logs.at(-1)).toMatch(/went cold .* Sending anyway, since this peer prompt cannot be sent again/)
     await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
     await clock.advance(3 * HOUR)
     // Claude Desktop hands a peer delivery in as an SDK turn; the envelope gives it away.
     const wrapped = await $.prompt.submit({ text: '<cross-session-message from="local_x" name="other">\nFYI\n</cross-session-message>', wait: false, origin: { kind: 'sdk' } })
     expect(wrapped.drop).toBe(undefined)
+    expect(w.logs.at(-1)).toMatch(/Sending anyway, since this cross-session-message prompt cannot be sent again/)
     await $.turn.complete(turn())
     await clock.advance(3 * HOUR)
     const typed = await $.prompt.submit(prompt('hi'))
@@ -993,7 +1003,7 @@ describe('restart after a quit', () => {
     expect(bear[2]).toMatch(/^Keepwarm sessions after Claude quit, /)
     const body = bear[4]
     expect(body).toMatch(/\*\*Recap\*\*: restarted automatically with 40m of warm cache left/)
-    expect(body).toMatch(/\*\*Old\*\*: cold since .*; reopening it re-writes 200,000 tokens, about \$2\.00\. \[Open\]\(claude:\/\/code\/continue\?session=local_c\)/)
+    expect(body).toMatch(/\*\*Old\*\*: cold since .*; reopening it re-writes 200,000 tokens, about \$1\.60\. \[Open\]\(claude:\/\/code\/continue\?session=local_c\)/)
     expect(body).toMatch(/\*\*Upgraded\*\*: not restarted, because Claude Code changed from 2\.1\.298 to 2\.1\.299/)
     expect(body).not.toMatch(/Gone|local_o/)
     expect(bear.slice(-2)).toEqual(['--tags', 'claude/keepwarm'])
@@ -1047,12 +1057,14 @@ describe('restart after a quit', () => {
   test('a loop that stopped itself keeps the reason in its record', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const store = new Map<string, unknown>()
-    world(on, [{ isAnswered: false, reason: 'api-error', status: 529, error: 'server_error', usage: usage() }], { store })
+    const overloaded: ForkAnswer = { isAnswered: false, reason: 'api-error', status: 529, error: 'server_error', usage: usage() }
+    world(on, [overloaded, overloaded, overloaded, overloaded], { store })
     await $.session.start(session)
     await $.command.run(run('keepwarm', '6h'))
     await $.turn.complete(turn())
-    await clock.advance(50 * MIN)
-    expect((store.get('rec:S1') as Rec).stop).toEqual({ at: START + 50 * MIN, why: 'the API call failed (529)' })
+    // Pings at 50m, then retries at 51m, 53m and 57m; the last failure stops the loop.
+    await clock.advance(57 * MIN)
+    expect((store.get('rec:S1') as Rec).stop).toEqual({ at: START + 57 * MIN, why: 'the API call failed (529) after 3 retries' })
   })
 
   test('the next process of that session says why in its status card', async ($, on) => {
@@ -1068,4 +1080,717 @@ describe('restart after a quit', () => {
 test('the report names a session by folder when it has no title', () => {
   const { body } = reportText([{ sid: 'abcdef123456', rec: rec({ title: null, cwd: '/Volumes/Black Razor/video projects' }), warmLeft: 0, revived: 'skipped' }], START, '2.1.299')
   expect(body).toMatch(/\*\*video projects\*\*: cold since/)
+})
+
+describe('prices', () => {
+  for (const [model, cold, warmTurn, pings] of [
+    ['claude-opus-5-5', '1.60', '0.04', 40],
+    ['claude-opus-5', '2.00', '0.10', 20],
+    ['claude-sonnet-5-5', '0.80', '0.02', 40],
+    ['claude-haiku-5-5', '0.20', '0.01', 20],
+    ['claude-mythos-5-1', '4.00', '0.05', 80],
+    ['claude-opus-4-1-20250805', '6.00', '0.30', 20],
+    ['claude-opus-4-20250514', '6.00', '0.30', 20],
+    ['claude-opus-4@20250514', '6.00', '0.30', 20],
+    ['claude-opus-4-1@20250805', '6.00', '0.30', 20],
+    ['anthropic.claude-opus-4-1-20250805-v1:0', '6.00', '0.30', 20],
+    ['claude-opus-4-1', '6.00', '0.30', 20],
+    ['claude-opus-4-5-20251101', '2.00', '0.10', 20],
+    ['claude-opus-4-5@20251101', '2.00', '0.10', 20],
+    ['anthropic.claude-opus-4-5-20251101-v1:0', '2.00', '0.10', 20],
+    ['claude-opus-4-8', '2.00', '0.10', 20],
+    ['claude-3-5-haiku-20241022', '0.32', '0.02', 20],
+  ] as const) {
+    test(`${model} at 200k tokens is priced from its own row`, async ($, on) => {
+      mock.clock(on, { now: START })
+      world(on, [], { live: { tokens: 200000 } })
+      await $.session.start(session)
+      await $.turn.complete(turn({ usage: usage({ model }) }))
+      const card = await $.command.run(run('cache-tax', ''))
+      expect(card.text).toMatch(`cold cost   $${cold} to re-write it (warm turn $${warmTurn})`)
+      expect(card.text).toMatch(`break-even  up to ${pings} pings`)
+    })
+  }
+
+  test('Haiku 5.5 up to 100k tokens takes the short-prompt row', async ($, on) => {
+    mock.clock(on, { now: START })
+    world(on, [], { live: { tokens: 100000 } })
+    await $.session.start(session)
+    await $.turn.complete(turn({ usage: usage({ model: 'claude-haiku-5-5' }) }))
+    const card = await $.command.run(run('cache-tax', ''))
+    expect(card.text).toMatch('cold cost   $0.02 to re-write it (warm turn $0.00)')
+  })
+})
+
+describe('keepwarm input', () => {
+  for (const args of ['3h every 60m', '3h every 90m', '3h every 2h']) {
+    test(`${args} is refused, since it would only fire on a cold cache`, async ($, on) => {
+      mock.clock(on, { now: START })
+      world(on, [])
+      await $.session.start(session)
+      const r = await $.command.run(run('keepwarm', args))
+      expect(r.text).toBe('every takes a period from 1m to 59m')
+      expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    })
+  }
+
+  test('every 59m pings before the cache goes cold', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h every 59m'))
+    await clock.advance(59 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  for (const args of ['0m', '0h', '0h0m']) {
+    test(`a ${args} window is refused`, async ($, on) => {
+      mock.clock(on, { now: START })
+      world(on, [])
+      await $.session.start(session)
+      const r = await $.command.run(run('keepwarm', args))
+      expect(r.text).toBe('keepwarm takes a window such as 6h or 90m, or always, off, or status')
+    })
+  }
+
+  test('a stored period of an hour or more falls back to 50m', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm], { store: new Map<string, unknown>([['deadline:S1', START + 3 * HOUR], ['every:S1', 90 * MIN]]) })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+})
+
+describe('always after /clear', () => {
+  test('arms a fresh window under the new session id', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    let sid = 'S1'
+    const w = world(on, [warm], { store, sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.get('deadline:S2')).toBe(START + 6 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+  })
+
+  test('without always, /clear leaves keepwarm off', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [warm])
+    await $.session.start(session)
+    await $.command.run(run('keepwarm', '3h'))
+    await $.turn.complete(turn())
+    await $.classic.SessionStart({ source: 'clear' })
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(0)
+  })
+})
+
+describe('guard by origin', () => {
+  for (const kind of ['task-notification', 'scheduled-trigger', 'peer', 'peer-send-message', 'observer'] as const) {
+    test(`a cold ${kind} prompt is sent and scored, and the next typed prompt is still refused`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await clock.advance(3 * HOUR)
+      const r = await $.prompt.submit({ text: 'agent finished', wait: false, origin: { kind } })
+      expect(r.drop).toBe(undefined)
+      expect(w.entered).toEqual(['agent finished'])
+      expect(w.logs.at(-1)).toMatch(new RegExp(`Sending anyway, since this ${kind} prompt cannot be sent again`))
+      await $.turn.complete(turn({ usage: usage({ cache_read_input_tokens: 0, cache_creation_input_tokens: 200000 }) }))
+      expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid/)
+      await $.command.run(run('keepwarm', 'off'))
+      await clock.advance(3 * HOUR)
+      expect((await $.prompt.submit(prompt('hi'))).drop).toMatch(/^cache-tax: the prompt cache went cold/)
+    })
+  }
+
+  for (const origin of [
+    { kind: 'bridge' }, { kind: 'sdk' }, { kind: 'slack-ping' },
+  ] satisfies PromptSubmitInput['origin'][]) {
+    test(`a cold ${origin.kind} prompt, which a person may have sent, is refused like a typed one`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      world(on, [])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await clock.advance(3 * HOUR)
+      expect((await $.prompt.submit({ text: 'hi', wait: false, origin })).drop).toMatch(/^cache-tax:/)
+    })
+  }
+
+  // Upstream 2.2.2 keeps the guard for these; this fork sends every origin but composer, bridge, sdk and slack-ping.
+  for (const origin of [
+    { kind: 'unclassified' }, { kind: 'channel', server: 'telegram' }, { kind: 'auto-continuation' },
+  ] satisfies PromptSubmitInput['origin'][]) {
+    test(`a cold ${origin.kind} prompt is sent with its price logged`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await clock.advance(3 * HOUR)
+      expect((await $.prompt.submit({ text: 'hi', wait: false, origin })).drop).toBe(undefined)
+      expect(w.entered).toEqual(['hi'])
+      expect(w.logs.at(-1)).toMatch(new RegExp(`Sending anyway, since this ${origin.kind} prompt cannot be sent again`))
+    })
+  }
+})
+
+describe('ping failures', () => {
+  test('after a restart with nothing to fork, the window waits for the next turn instead of stopping', async ($, on) => {
+    const clock = mock.clock(on, { now: 10 * HOUR })
+    const store = new Map<string, unknown>([['deadline:S1', 13 * HOUR]])
+    const w = world(on, [{ isAnswered: false, reason: 'nothing-to-fork' }, warm], { store })
+    await $.session.start(session)
+    await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 40 * 60, context_tokens: 200000 })
+    await clock.advance(10 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toBe('keepwarm 2h50m left · nothing to fork yet, first ping after the next turn')
+    expect(store.get('deadline:S1')).toBe(13 * HOUR)
+    await clock.advance(HOUR)
+    expect(w.forks.length).toBe(1)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+  })
+
+  for (const status of [429, 529, 500, null]) {
+    test(`an API error ${status} is retried and the loop goes on once a ping lands`, async ($, on) => {
+      const clock = mock.clock(on, { now: START })
+      const w = world(on, [{ isAnswered: false, reason: 'api-error', status, error: 'rate_limit', usage: usage() }, warm, warm])
+      await $.session.start(session)
+      await $.turn.complete(turn())
+      await $.command.run(run('keepwarm', '3h'))
+      await clock.advance(50 * MIN)
+      expect(w.forks.length).toBe(1)
+      expect(w.status.at(-1)).toBe('keepwarm 2h10m left · API busy, ping retry 1 of 3')
+      await clock.advance(MIN)
+      expect(w.forks.length).toBe(2)
+      expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+      await clock.advance(50 * MIN)
+      expect(w.forks.length).toBe(3)
+    })
+  }
+
+  test('a lasting 429 stops after three retries, before the cache goes cold', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [busy, busy, busy, busy])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(57 * MIN)
+    expect(w.forks.length).toBe(4)
+    expect(w.status.at(-1)).toBe('keepwarm stopped: the API call failed (429) after 3 retries')
+    await clock.advance(2 * HOUR)
+    expect(w.forks.length).toBe(4)
+  })
+
+  test('a retry that would land within a minute of the cache going cold is not tried', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const w = world(on, [busy])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h every 58m'))
+    await clock.advance(58 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toBe('keepwarm stopped: the API call failed (429)')
+  })
+})
+
+describe('stale and late ping results', () => {
+  // The tsconfig loads no DOM or Node types; the runtime has a real setTimeout to let a released fork finish.
+  const realTimer = globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }
+  const settle = () => new Promise<void>(r => { realTimer.setTimeout(r, 20) })
+  const gated = () => {
+    let release = () => {}
+    return { gate: () => new Promise<void>(r => { release = r }), release: () => release() }
+  }
+
+  test('a 429 that lands after a compaction schedules no retry', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const g = gated()
+    const w = world(on, [busy], { gate: g.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    await $.session.compact({ trigger: 'manual', messages: [{ role: 'user', text: 'summary', toolUses: [] }] })
+    g.release()
+    await settle()
+    await clock.advance(5 * MIN)
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toBe('keepwarm 2h10m left · waiting for the first turn after compaction')
+  })
+
+  test('a 429 that lands after /clear with always on leaves the new window alone', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    let sid = 'S1'
+    const g = gated()
+    const w = world(on, [busy], { store, sid: () => sid, gate: g.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    g.release()
+    await settle()
+    expect(store.get('deadline:S2')).toBe(START + 50 * MIN + 6 * HOUR)
+    expect(w.status.at(-1)).toBe('keepwarm 6h00m left · waiting for the first turn')
+  })
+
+  test('nothing to fork that lands after a turn does not hold the next ping', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const g = gated()
+    const w = world(on, [nothing, warm], { gate: async () => { if (w.forks.length === 1) await g.gate() } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await $.turn.complete(turn())
+    g.release()
+    await settle()
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+  })
+
+  test('a retry whose timer fires inside the last minute is not sent', async ($, on) => {
+    let now = START
+    const timers: Array<() => void> = []
+    on('clock.now', () => ({ value: now }))
+    on('clock.after', () => new Promise<{ value: void }>(r => { timers.push(() => r({ value: undefined })) }))
+    const w = world(on, [busy, warm])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toBe('keepwarm 2h10m left · API busy, ping retry 1 of 3')
+    // The host slept through the retry's one-minute slot and wakes 30 seconds before the cache goes cold.
+    now += 9.5 * 60 * 1000
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toBe('keepwarm stopped: the API call failed (429) after 1 retry')
+  })
+})
+
+describe('price edge cases', () => {
+  test('Claude Haiku 3.5 by display name takes the Haiku 3.5 row', async ($, on) => {
+    mock.clock(on, { now: START })
+    world(on, [], { live: { tokens: 200000 } })
+    await $.session.start(session)
+    await $.turn.complete(turn({ usage: usage({ model: 'Claude Haiku 3.5' }) }))
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch('cold cost   $0.32 to re-write it (warm turn $0.02)')
+  })
+
+  test('without step usage, a Haiku 5.5 comeback is priced at the tier of the context it re-sent', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [])
+    await $.session.start(session)
+    await $.command.run(run('cache-tax', 'guard warn'))
+    await $.turn.complete(turn({ usage: usage({ model: 'claude-haiku-5-5', cache_read_input_tokens: 0, cache_creation_input_tokens: 99000 }) }))
+    await clock.advance(2 * HOUR)
+    // Two requests summed: the 99k comeback write under 100k, then a step that crossed it.
+    await $.turn.complete(turn({ usage: usage({ model: 'claude-haiku-5-5', cache_read_input_tokens: 0, cache_creation_input_tokens: 100500 }) }))
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid, \$0\.02/)
+  })
+})
+
+describe('per-request pricing and window extension', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+  const haiku = (read: number, write: number) => usage({ model: 'claude-haiku-5-5', cache_read_input_tokens: read, cache_creation_input_tokens: write })
+  const step = async ($: Parameters<TestBody>[0], index: number) => {
+    for await (const c of $.turn.step({ turnId: 'comeback', index, model: 'claude-haiku-5-5', messageCount: 2 })) void c
+  }
+
+  test('a Haiku 5.5 comeback request over 100k is priced at the long tier though the context before was under it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [], { steps: [haiku(0, 101000)] })
+    await $.session.start(session)
+    await $.command.run(run('cache-tax', 'guard warn'))
+    await $.turn.complete(turn({ usage: haiku(0, 99000) }))
+    await clock.advance(2 * HOUR)
+    await step($, 0)
+    await $.turn.complete(turn({ usage: haiku(0, 101000) }))
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid, \$0\.10/)
+  })
+
+  test('a Haiku 5.5 turn whose requests straddle 100k prices each write at its own tier', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    world(on, [], { steps: [haiku(0, 99000), haiku(99000, 60000)] })
+    await $.session.start(session)
+    await $.command.run(run('cache-tax', 'guard warn'))
+    await $.turn.complete(turn({ usage: haiku(0, 99000) }))
+    await clock.advance(2 * HOUR)
+    await step($, 0)
+    await step($, 1)
+    // 99,000 at $0.20 plus 60,000 at $1, against $0.16 for all at $1 or $0.03 for all at $0.20.
+    await $.turn.complete(turn({ usage: haiku(99000, 159000) }))
+    expect((await $.command.run(run('cache-tax', ''))).text).toMatch(/session     1 cold write paid, \$0\.08/)
+  })
+
+  test('a ping out when /keepwarm extends the window still counts', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let release = () => {}
+    const w = world(on, [warm, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { release = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(1)
+    await $.command.run(run('keepwarm', '6h'))
+    release()
+    await settle()
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+  })
+})
+
+describe('pings in flight', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+  // Holds the first fork until released; later forks answer at once.
+  const holdFirst = (w: () => { forks: number[] }) => {
+    let release = () => {}
+    const gate = async () => { if (w().forks.length === 1) await new Promise<void>(r => { release = r }) }
+    return { gate, release: () => release() }
+  }
+
+  test('extending the window while a ping is out sends no second ping, and a cold reply then stops it', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const h = holdFirst(() => w)
+    const w = world(on, [{ read: 0, write: 200000 }, warm], { gate: h.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await $.command.run(run('keepwarm', '6h'))
+    await clock.advance(5 * 1000)
+    expect(w.forks.length).toBe(1)
+    h.release()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/keepwarm stopped: the ping read 0 and wrote 200k/)
+  })
+
+  test('a main request while a ping is out supersedes its cold reply', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const h = holdFirst(() => w)
+    const w = world(on, [{ read: 0, write: 200000 }, warm], { gate: h.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await clock.advance(MIN)
+    for await (const c of $.turn.step({ turnId: 'next', index: 0, model: 'claude-fable-5-1', messageCount: 3 })) void c
+    h.release()
+    await settle()
+    expect(w.status.at(-1)).not.toMatch(/stopped/)
+    await $.turn.complete(turn())
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/ping in 50m · last ping read 200k/)
+  })
+
+  test('a turn aborted before any request keeps the reply of a ping that was out', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const h = holdFirst(() => w)
+    const w = world(on, [warm, warm], { gate: h.gate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await clock.advance(MIN)
+    await $.turn.complete(turn({ isAborted: true, usage: undefined }))
+    h.release()
+    await settle()
+    expect(w.status.at(-1)).toMatch(/last ping read 200k/)
+    // The next ping counts from the ping's own read, not from the aborted turn.
+    await clock.advance(49 * MIN)
+    expect(w.forks.length).toBe(2)
+  })
+})
+
+describe('ping timing races', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a timer that fires while another ping waits on the clock never sends a second fork', async ($, on) => {
+    let now = START
+    let hold: Promise<void> | null = null
+    let releaseClock = () => {}
+    const timers: Array<() => void> = []
+    on('clock.now', async () => {
+      const h = hold
+      hold = null
+      if (h) await h
+      return { value: now }
+    })
+    on('clock.after', () => new Promise<{ value: void }>(r => { timers.push(() => r({ value: undefined })) }))
+    // Ping B's fork stays out until released, so it is in flight when A resumes.
+    let releaseFork = () => {}
+    const w = world(on, [warm, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { releaseFork = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    // Ping A's clock read is held; the extension's own reads go through.
+    hold = new Promise<void>(r => { releaseClock = r })
+    timers.at(-1)?.()
+    await settle()
+    await $.command.run(run('keepwarm', '6h'))
+    now += 1000
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    releaseClock()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    releaseFork()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/last ping read 200k/)
+  })
+
+  test('a superseded reply followed by an early timer still leaves the window armed', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let release = () => {}
+    const w = world(on, [warm, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { release = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await $.command.run(run('keepwarm', '6h'))
+    // A long tool call: the turn's first request lands, and the turn does not complete.
+    for await (const c of $.turn.step({ turnId: 'long', index: 0, model: 'claude-fable-5-1', messageCount: 3 })) void c
+    release()
+    await settle()
+    await clock.advance(2 * 1000)
+    await clock.advance(50 * MIN)
+    expect(w.forks.length).toBe(2)
+  })
+})
+
+describe('retry after a window extension', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a 429 that lands after /keepwarm extends the window waits the full retry delay', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    let release = () => {}
+    const w = world(on, [busy, warm], { gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { release = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    await $.command.run(run('keepwarm', '6h'))
+    release()
+    await settle()
+    expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
+    // The extension's one-second timer is gone; only the one-minute retry remains.
+    await clock.advance(30 * 1000)
+    expect(w.forks.length).toBe(1)
+    await clock.advance(30 * 1000)
+    expect(w.forks.length).toBe(2)
+    expect(w.status.at(-1)).toMatch(/last ping read 200k/)
+  })
+})
+
+describe('one timer at a time', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a 429 that lands while /keepwarm is reading the clock leaves one live timer', async ($, on) => {
+    let now = START
+    let holdNext = false
+    let releaseClock = () => {}
+    const timers: Array<() => void> = []
+    on('clock.now', async () => {
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>(r => { releaseClock = r })
+      }
+      return { value: now }
+    })
+    on('clock.after', () => new Promise<{ value: void }>(r => { timers.push(() => r({ value: undefined })) }))
+    // The extension writes its deadline, then arms; holding the next clock read pauses it inside arm().
+    let watch = false
+    class Store extends Map<string, unknown> {
+      override set(key: string, value: unknown) {
+        if (watch && key === 'deadline:S1') holdNext = true
+        return super.set(key, value)
+      }
+    }
+    let releaseFork = () => {}
+    const w = world(on, [busy, busy, busy, warm], { store: new Store(), gate: async () => { if (w.forks.length === 1) await new Promise<void>(r => { releaseFork = r }) } })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    const before = timers.length
+    watch = true
+    const extension = $.command.run(run('keepwarm', '6h'))
+    await settle()
+    releaseFork()
+    await settle()
+    releaseClock()
+    await extension
+    await settle()
+    // Two timers were set since the first ping: the retry's, then the extension's. Fire the extension's at
+    // one second and the retry's at its minute, a beat apart, as the host would; only a live timer may send.
+    expect(timers.length - before).toBe(2)
+    now += 1000
+    timers[before + 1]?.()
+    await settle()
+    expect(w.forks.length).toBe(2)
+    now += MIN
+    timers[before]?.()
+    await settle()
+    expect(w.forks.length).toBe(2)
+  })
+})
+
+describe('a paused ping yields to a newer schedule', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a ping paused on the clock does not send after a newer ping set a retry', async ($, on) => {
+    let now = START
+    let holdNext = false
+    let releaseClock = () => {}
+    const timers: Array<() => void> = []
+    on('clock.now', async () => {
+      if (holdNext) {
+        holdNext = false
+        await new Promise<void>(r => { releaseClock = r })
+      }
+      return { value: now }
+    })
+    on('clock.after', () => new Promise<{ value: void }>(r => { timers.push(() => r({ value: undefined })) }))
+    const w = world(on, [busy, busy, busy, busy])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    // Ping A pauses on its clock read.
+    holdNext = true
+    timers.at(-1)?.()
+    await settle()
+    // The extension sets timer B; B pings, gets a 429 and schedules a one-minute retry.
+    await $.command.run(run('keepwarm', '6h'))
+    now += 1000
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
+    releaseClock()
+    await settle()
+    expect(w.forks.length).toBe(1)
+    expect(w.status.at(-1)).toMatch(/API busy, ping retry 1 of 3/)
+  })
+})
+
+describe('/clear overlapping /keepwarm', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('a window armed while /clear is still running keeps a timer', async ($, on) => {
+    let now = START
+    let hold: Promise<void> | null = null
+    const holdNextRead = () => {
+      let release = () => {}
+      hold = new Promise<void>(r => { release = r })
+      return () => release()
+    }
+    const timers: Array<() => void> = []
+    const waits: number[] = []
+    on('clock.now', async () => {
+      const h = hold
+      hold = null
+      if (h) await h
+      return { value: now }
+    })
+    on('clock.after', ($, e) => new Promise<{ value: void }>(r => { waits.push(e.ms); timers.push(() => r({ value: undefined })) }))
+    const w = world(on, [warm, warm])
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    now += 50 * MIN
+    // Ping A fires and pauses on its clock read.
+    const releaseA = holdNextRead()
+    timers.at(-1)?.()
+    await settle()
+    // /clear stops the old window and pauses on its last clock read.
+    const releaseClear = holdNextRead()
+    const clearing = $.classic.SessionStart({ source: 'clear' })
+    await settle()
+    // /keepwarm arms a new window meanwhile; then /clear finishes.
+    await $.command.run(run('keepwarm', '6h'))
+    const beforeClearEnds = timers.length
+    releaseClear()
+    await clearing
+    await settle()
+    // /clear cancelled the window's timer in its reset, so it must set a new one: the wake at the deadline,
+    // since the new conversation has no request yet.
+    expect(timers.length).toBe(beforeClearEnds + 1)
+    expect(waits.at(-1)).toBe(6 * HOUR)
+    // A wakes, finds the schedule changed and a timer in place, and sends nothing.
+    releaseA()
+    await settle()
+    expect(w.forks.length).toBe(0)
+    expect(timers.length).toBe(beforeClearEnds + 1)
+    // The first turn of the new conversation starts the pings as usual.
+    await $.turn.complete(turn())
+    now += 50 * MIN
+    timers.at(-1)?.()
+    await settle()
+    expect(w.forks.length).toBe(1)
+  })
+})
+
+describe('fork features on the 2.2.2 loop', () => {
+  test('a warm ping after a retried 429 publishes lastPing and saves the record; the 429 does neither', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const published: unknown[] = []
+    on('state.set', ($, e) => { published.push(e.value); return { value: { isSet: true as const, version: published.length } } })
+    const store = new Map<string, unknown>()
+    world(on, [busy, warm], { store })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await $.command.run(run('keepwarm', '3h'))
+    await clock.advance(50 * MIN)
+    expect(published).toEqual([])
+    expect((store.get('rec:S1') as Rec).warmAt).toBe(START)
+    await clock.advance(MIN)
+    expect(published).toEqual([{ at: START + 51 * MIN, read: 200000, write: 0 }])
+    expect((store.get('rec:S1') as Rec).warmAt).toBe(START + 51 * MIN)
+  })
+
+  test('/clear with always on drops the old record and keeps one under the new session id', async ($, on) => {
+    mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    let sid = 'S1'
+    world(on, [], { store, sid: () => sid })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    expect((store.get('rec:S1') as Rec).deadline).toBe(START + 6 * HOUR)
+    sid = 'S2'
+    await $.classic.SessionStart({ source: 'clear' })
+    expect(store.has('rec:S1')).toBe(false)
+    expect((store.get('rec:S2') as Rec).deadline).toBe(START + 6 * HOUR)
+  })
 })

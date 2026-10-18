@@ -36,13 +36,13 @@ In a warm session, run `/keepwarm` to arm six hours. Use `/keepwarm 90m` for a s
 
 **Before a break:** `/keepwarm` arms a bounded window. After 50 idle minutes, a timer inside Claude Code sends one tool-less fork over the session's transcript. It reads usage after every ping and stops if reads are zero or writes reach 10% of reads. There is no background transcript-polling loop.
 
-**When you return cold:** for a context of at least 50,000 tokens, the guard drops your ordinary message once when its one-hour clock says cold. It shows the estimated rewrite price. Resend to continue, or `/clear` and start from a note. A message that did not come from you (another session's message, a scheduled trigger, a relay) has nobody to resend it, so it goes through with the price logged instead of being dropped.
+**When you return cold:** for a context of at least 50,000 tokens, the guard drops your ordinary message once when its one-hour clock says cold. It shows the estimated rewrite price. Resend to continue (or press Resend and pay in the row above the prompt), or `/clear` and start from a note. A prompt no person sent, such as a background task's notification, a scheduled prompt, another session's message or a relay, is sent with the price logged, because nobody is there to resend it. Only prompts typed in the composer or sent over Remote Control, from an SDK host or as a Slack ping keep the guard; every other origin goes through priced, and so does an SDK turn that Claude Desktop wraps in a known automated envelope such as a cross-session message.
 
 **When Claude quits:** a session shut down with its window still running (Claude Desktop quitting or updating, a SIGTERM) leaves a record of its cache clock. The first session to start afterwards reads those records. A session whose cache is still warm, on the same Claude Code version and still in the sidebar, gets a short message: Claude Desktop restarts its process to deliver it, the mod there swallows it without a turn, and keepwarm picks up from the recorded clock. Every other one is listed with the price of reopening it. The list goes to one Bear note tagged `claude/keepwarm` (or `~/.claude/cache-tax-report.md` without Bear), a line in that session and a macOS notification. In Claude Desktop the ending session also leaves a small detached watcher: if the whole app quits and comes back while the cache is still warm and no session has started, it opens that one session through its `claude://code/continue` link, which then revives the rest. A different Claude Code version builds a different prompt prefix, so after an update the sessions are listed, not revived.
 
 A detected cold write automatically arms at least three hours of keepwarm. `/cache-tax` shows the current cache estimate, warming window and this session's cold-write tally.
 
-Windows belong to individual sessions. An already-cold session waits for your next turn before pinging. With `always` on, each turn moves the deadline to six hours after it, so a session left open all day does not outlive its window. A window ends at its deadline; `/keepwarm off` also cancels it and clears the always setting.
+Windows belong to individual sessions. An already-cold session waits for your next turn before pinging, and so does a window restored after Claude Code restarts, until the new process has a turn to fork. With `always` on, each turn moves the deadline to six hours after it, so a session left open all day does not outlive its window. A ping refused by a busy API (429, 529, 5xx) is retried after 1, 2 and 4 minutes while it can still land before the cache goes cold. A window ends at its deadline; `/keepwarm off` also cancels it and clears the always setting.
 
 ### A recorded warming ping
 
@@ -62,8 +62,8 @@ New to caching? [Anthropic explains how Claude Code uses it](https://code.claude
 
     /keepwarm               keep warm for six hours
     /keepwarm 90m           keep warm for a window of your own (also 2h30m, 6h)
-    /keepwarm always        keep every session warm until six hours after its last turn, remembered across sessions
-    /keepwarm 6h every 2m   pinging every two minutes; a testing knob, floor 1m, forgotten after this window
+    /keepwarm always        keep every session warm until six hours after its last turn, armed at session start and after /clear, remembered across sessions
+    /keepwarm 6h every 2m   pinging every two minutes; a testing knob, 1m to 59m, forgotten after this window
     /keepwarm status        the warming window, next ping and last receipt
     /keepwarm off           stop, forget the window, and turn always off
     /cache-tax              the card
@@ -136,7 +136,7 @@ The mock-clock tests prove the timer, the guard and the scoring, not that a fork
     > Reply with one word: ready
     > /keepwarm 1h every 1m
 
-Watch the row above the prompt after a minute, or the plain status text on other surfaces. `last ping read 20k $0.01` reports the fork's readback. `keepwarm stopped: the ping read ... and wrote ...` means the readback did not meet the warm threshold; the loop has stopped. An API failure, interruption, empty reply or missing conversation also stops the loop with a reason. Older engines that return null show a combined cold-snapshot or API-failure message. Finish with `/keepwarm off`. This short check establishes a cache read, not retention across the default 50-minute interval.
+Watch the row above the prompt after a minute, or the plain status text on other surfaces. `last ping read 20k $0.01` reports the fork's readback. `keepwarm stopped: the ping read ... and wrote ...` means the readback did not meet the warm threshold; the loop has stopped. `API busy, ping retry 1 of 3` means a 429, 529 or 5xx is being retried; the loop stops if the API is still busy after three retries or a minute before the cache goes cold. `nothing to fork yet` means the process has no conversation to fork, as after a restart; the window waits for your next message. Any other API error, an interruption or an empty reply stops the loop with a reason. Older engines that return null show a combined cold-snapshot or API-failure message. Finish with `/keepwarm off`. This short check establishes a cache read, not retention across the default 50-minute interval.
 
 ## Tests and typecheck
 
@@ -147,15 +147,16 @@ claude plugin validate .claude-plugin/plugin.json
 claude plugin test .
 ```
 
-The [56 tests](tests/register.test.ts) use a mock clock and engine. They cover:
+The [134 tests](tests/register.test.ts) use a mock clock and engine. They cover:
 
-- **Guard:** refuse once and resend, warn mode, slash commands, small contexts, resume seeding and cold-write scoring.
-- **Warming:** command defaults, always/off, idle resets, usage-based stopping, cold-window expiry and delayed timers after sleep.
+- **Guard:** refuse once and resend, the Resend and pay button, warn mode, slash commands, small contexts, prompts nobody typed (peer, trigger, channel, unclassified and envelope-wrapped SDK turns), resume seeding and cold-write scoring.
+- **Warming:** command defaults and refused windows and periods, always/off, always as a rolling window from the last turn, a longer window kept when always re-arms at session start, always after `/clear`, idle resets, usage-based stopping, cold-window expiry, delayed timers after sleep and the `lastPing` state published after a warm ping.
 - **Session state:** isolated store keys, restored windows, legacy cleanup, clear/compaction resets and subagent isolation.
-- **Pricing and display:** model matching, output and uncached input costs, context counts, duration formatting and the read-only break-even figure.
+- **Restart after a quit:** the session record and relaunch watcher left at a shutdown, reviving warm sessions by message once, the Bear or file report, the swallowed revive message and the last stop reason carried across restarts.
+- **Pricing and display:** a row for every listed model, the Haiku 5.5 long-prompt tier priced per request, Opus 4 and 4.1 apart from Opus 4.5, output and uncached input costs, context counts, duration formatting and the read-only break-even figure.
 - **Indicator:** terminal images and desktop SVGs, theme selection, warm/cold transitions, resume, compaction, clear, expiry, surveys, other mods' content, text alternatives and `NO_COLOR` fallback.
 - **Preferences:** one read per session, immediate theme updates, denied changes and the effective theme returned by the settings writer.
-- **Fork failures:** structured failure results from current engines and the null result returned by older releases stop without retrying.
+- **Fork failures:** a busy API is retried while the cache is warm, a retry that wakes too late is dropped, nothing to fork waits for the next turn, one ping is out at a time, a reply that lands after a request, `/clear` or compaction is discarded, and other failures and the null result returned by older releases stop without retrying.
 
 The render tests check the element tree, not native terminal or desktop pixels. They do not validate server-side cache retention. See [the live check](#prove-it-on-your-own-session).
 
