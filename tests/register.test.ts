@@ -35,12 +35,12 @@ type ForkAnswer = null | ModelForkResult | { read: number; write: number; out?: 
 
 // The world beneath the mod: its store, the engine's answers, and a fork that
 // replies from a script so each test decides what the cache looked like.
-function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[] } = {}) {
+function world(on: On, forkAnswers: ForkAnswer[], opts: { store?: Map<string, unknown>; commands?: string[]; live?: { tokens?: number }; sid?: string | (() => string); model?: string; bandText?: string; theme?: { value: string }; noColor?: boolean; denyTheme?: boolean; writtenTheme?: string; gate?: () => Promise<void>; steps?: TurnUsage[]; storeGate?: (op: 'set' | 'delete', key: string) => Promise<void> } = {}) {
   if (opts.store) {
     const store = opts.store
     on('store.get', ($, e) => ({ value: store.get(e.key) }))
-    on('store.set', ($, e) => { store.set(e.key, e.value); return { value: undefined } })
-    on('store.delete', ($, e) => { store.delete(e.key); return { value: undefined } })
+    on('store.set', async ($, e) => { await opts.storeGate?.('set', e.key); store.set(e.key, e.value); return { value: undefined } })
+    on('store.delete', async ($, e) => { await opts.storeGate?.('delete', e.key); store.delete(e.key); return { value: undefined } })
     on('store.keys', () => ({ value: [...store.keys()] }))
   } else mock.store(on, {})
   const reads = { theme: 0, env: 0 }
@@ -1592,6 +1592,40 @@ describe('always covers any break up to six hours', () => {
     expect(store.get('deadline:S1')).toBe(START + 90 * MIN)
     await clock.advance(10 * MIN)
     expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    expect(w.forks.length).toBe(0)
+  })
+})
+
+describe('/keepwarm off during a rolling turn', () => {
+  const settle = () => new Promise<void>(r => { (globalThis as unknown as { setTimeout(fn: () => void, ms: number): unknown }).setTimeout(r, 20) })
+
+  test('off wins over the window a finishing turn was opening', async ($, on) => {
+    const clock = mock.clock(on, { now: START })
+    const store = new Map<string, unknown>([['always', true]])
+    let holdEveryDelete = false
+    let release = () => {}
+    const storeGate = async (op: 'set' | 'delete', key: string) => {
+      if (holdEveryDelete && op === 'delete' && key === 'every:S1') {
+        holdEveryDelete = false
+        await new Promise<void>(r => { release = r })
+      }
+    }
+    const w = world(on, [warm, warm], { store, storeGate })
+    await $.session.start(session)
+    await $.turn.complete(turn())
+    await clock.advance(10 * MIN)
+    // The next turn's roll pauses while saving its window; /keepwarm off runs to the end meanwhile.
+    holdEveryDelete = true
+    const finishing = $.turn.complete(turn())
+    await settle()
+    expect((await $.command.run(run('keepwarm', 'off'))).text).toMatch(/^keepwarm is off/)
+    release()
+    await finishing
+    await settle()
+    expect(store.has('deadline:S1')).toBe(false)
+    expect(store.has('always')).toBe(false)
+    expect((await $.command.run(run('keepwarm', 'status'))).text).toBe('keepwarm is off')
+    await clock.advance(2 * HOUR)
     expect(w.forks.length).toBe(0)
   })
 })

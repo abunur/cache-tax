@@ -73,6 +73,7 @@ export type State = {
   retryReason: string
   gen: number
   tick: number
+  offs: number
   inFlight: boolean
   stepWrites: { usd: number; priced: boolean } | null
 }
@@ -233,6 +234,11 @@ async function prune($: EngineInterface, s: State, now: number) {
 }
 
 async function stop($: EngineInterface, s: State, why: string | null, forgetAlways = false) {
+  // Set before any await, so a window being opened at the same moment sees the off and does not write itself back.
+  if (forgetAlways) {
+    s.always = false
+    s.offs++
+  }
   s.deadline = 0
   s.every = PING_AFTER_MS
   s.stopped = why
@@ -241,10 +247,7 @@ async function stop($: EngineInterface, s: State, why: string | null, forgetAlwa
   disarm(s)
   await $.store.delete(deadlineKey(s))
   await $.store.delete(everyKey(s))
-  if (forgetAlways) {
-    s.always = false
-    await $.store.delete(KEY_ALWAYS)
-  }
+  if (forgetAlways) await $.store.delete(KEY_ALWAYS)
   updateStatus($, s, await $.clock.now())
 }
 
@@ -349,13 +352,25 @@ function armedText(s: State, now: number, windowMs: number): string {
 }
 
 async function startWindow($: EngineInterface, s: State, windowMs: number, every: number) {
+  // A /keepwarm off that lands while this awaits wins: the window it cancelled is not written back.
+  const offs = s.offs
   const now = await $.clock.now()
+  if (s.offs !== offs) return
+  const deadline = now + windowMs
   s.every = every
+  s.deadline = deadline
+  s.stopped = null
   if (every === PING_AFTER_MS) await $.store.delete(everyKey(s))
   else await $.store.set(everyKey(s), every)
-  s.deadline = now + windowMs
-  s.stopped = null
-  await $.store.set(deadlineKey(s), s.deadline)
+  await $.store.set(deadlineKey(s), deadline)
+  if (s.offs !== offs) {
+    // Remove only what this call wrote; a window armed after the off is left alone.
+    if ((await $.store.get(deadlineKey(s))) === deadline) {
+      await $.store.delete(deadlineKey(s))
+      if (!s.deadline) await $.store.delete(everyKey(s))
+    }
+    return
+  }
   await arm($, s)
 }
 
@@ -383,7 +398,7 @@ export function freshState(): State {
   return {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, misses: [], pending: null, last: null, stopped: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, inFlight: false, stepWrites: null,
+    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, inFlight: false, stepWrites: null,
   }
 }
 
