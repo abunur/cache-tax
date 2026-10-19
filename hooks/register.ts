@@ -21,7 +21,8 @@ const RECORD_KEEP_MS = 7 * 24 * 60 * 60 * 1000
 // A session revived with less warm time than this would only ping into a cache about to expire.
 const REVIVE_MARGIN_MS = 3 * 60 * 1000
 const REVIVE_MARK = '[cache-tax revive]'
-const REVIVE_TEXT = `${REVIVE_MARK} Claude restarted while this session's cache was still warm; keepwarm resumes here. No reply needed.`
+// A new process has nothing to fork until one turn has run, so the revive is that turn: one cache read and a word back.
+const REVIVE_TEXT = `${REVIVE_MARK} Claude restarted while this session's prompt cache was still warm, and keepwarm needs one turn in the new process before it can ping. Reply with the single word: warm. Use no tools and send no messages.`
 // Origins a person typed or sent keep the guard. Every other origin (task notifications, schedules, peer
 // sessions, relays, observers, and also channels, auto-continuations and unclassified prompts, which upstream
 // 2.2.2 still guards) has no one to resend a refused send, so it goes through priced.
@@ -111,6 +112,8 @@ export type State = {
   /** Why and when the loop last stopped on its own, kept across restarts so a later status can say. */
   lastStop: { at: number; why: string } | null
   waitForTurn: boolean
+  /** A main-thread turn reached the API in this process and conversation, so the engine has something to fork. */
+  primed: boolean
   retries: number
   retryReason: string
   gen: number
@@ -230,6 +233,7 @@ export function resetForClear(s: State) {
   s.local = undefined
   s.lastStop = null
   s.waitForTurn = false
+  s.primed = false
   s.stepWrites = null
   outdate(s)
   disarm(s)
@@ -452,9 +456,16 @@ async function reviveOthers($: EngineInterface, s: State) {
   }
 }
 
+/** Whether a revive should run as its turn: only while the cache is warm and before this process has a turn to fork from. */
+function reviveRuns(s: State, now: number): boolean {
+  return Boolean(s.deadline && s.lastRequestAt) && !isCold(s, now) && !s.primed
+}
+
 function reviveLine(s: State, now: number): string {
   if (!s.deadline || !s.lastRequestAt || isCold(s, now)) return 'restarted after Claude came back, but the cache had already gone cold; keepwarm waits for the next turn'
-  return `restarted after Claude came back with ${fmtDuration(s.lastRequestAt + TTL_MS - now)} of warm cache left; the window is kept and no turn was run, and pings resume after the next turn here, since a new process has nothing to fork before one`
+  const left = `restarted after Claude came back with ${fmtDuration(s.lastRequestAt + TTL_MS - now)} of warm cache left`
+  if (s.primed) return `${left}; this process has run a turn already, so the window is kept and no other turn is needed`
+  return `${left}; running one short turn so the new process has a conversation to fork, and pings resume ${fmtDuration(s.every)} after it`
 }
 
 function when(ms: number): string {
@@ -468,7 +479,7 @@ export function reportText(rows: ReviveRow[], now: number, version: string | nul
     const name = r.rec.title ?? (r.rec.cwd ? r.rec.cwd.split('/').filter(Boolean).pop() : null) ?? r.sid.slice(0, 8)
     const price = priceOf(r.rec.model, r.rec.ctx)
     const reopen = `reopening it re-writes ${r.rec.ctx.toLocaleString('en-US')} tokens, about ${fmtUsd(price ? r.rec.ctx * price[1] / 1e6 : null)}`
-    const what = r.revived === 'sent' ? `restarted automatically with ${fmtDuration(r.warmLeft)} of warm cache left; its window is kept and pings resume after its next turn, so one message there before ${when(r.rec.warmAt + TTL_MS)} keeps it warm`
+    const what = r.revived === 'sent' ? `restarted automatically with ${fmtDuration(r.warmLeft)} of warm cache left; it runs one short turn to re-read its cache, so its window is kept and pings resume ${fmtDuration(r.rec.every)} after that turn`
       : r.warmLeft <= REVIVE_MARGIN_MS ? `cold since ${when(r.rec.warmAt + TTL_MS)}; ${reopen}`
       : r.revived === 'skipped' ? `not restarted, because Claude Code changed from ${r.rec.version} to ${version} and the old cache no longer matches; ${reopen}`
       : `could not be restarted (${r.revived}); its cache stays warm until ${when(r.rec.warmAt + TTL_MS)}, then ${reopen}`
@@ -565,6 +576,7 @@ async function ping($: EngineInterface, s: State) {
     // A restarted process has no conversation to fork until its first turn; the window waits for one instead of ending.
     if (reply.reason === 'nothing-to-fork') {
       s.waitForTurn = true
+      s.primed = false
       return arm($, s)
     }
     const reason = reply.reason === 'api-error' ? `the API call failed${reply.status === null ? '' : ` (${reply.status})`}`
@@ -692,7 +704,7 @@ export function freshState(): State {
     hasBand: false, sid: '', deadline: 0, every: PING_AFTER_MS, always: false, lastRequestAt: 0, lastModel: null, ctx: 0, compacted: false,
     guard: 'refuse', ackedAt: 0, coldWritePending: false, blocked: null, misses: [], pending: null, last: null, stopped: null,
     cwd: null, title: null, local: undefined, version: null, lastStop: null,
-    waitForTurn: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, inFlight: false, stepWrites: null,
+    waitForTurn: false, primed: false, retries: 0, retryReason: '', gen: 0, tick: 0, offs: 0, inFlight: false, stepWrites: null,
   }
 }
 
@@ -828,6 +840,8 @@ export const register: Register = on => {
       else updateStatus($, s, await $.clock.now())
       return r
     }
+    // The engine forks only from a request of the conversation now loaded, so a resumed or forked one has none yet.
+    if (e.source === 'resume' || e.source === 'fork') s.primed = false
     const now = await $.clock.now()
     let line = seedFromResume(s, e, now)
     if (!s.title && typeof e.session_title === 'string' && e.session_title) s.title = e.session_title
@@ -902,10 +916,13 @@ export const register: Register = on => {
     return { text: card(s, now) }
   })
 
-  // A revive that came as a peer delivery: the process restart was the point, so nothing is queued.
+  // A revive that came as a peer delivery is queued as the one turn that gives the new process something to fork;
+  // prompt.submit logs it. One that would only re-write a cold cache, or that a process with a turn behind it does not need, is taken.
   on('session.receive', async ($, e, next) => {
     if (!e.text.includes(REVIVE_MARK)) return next(e)
-    $.ui.log(reviveLine(s, await $.clock.now()))
+    const now = await $.clock.now()
+    if (reviveRuns(s, now)) return next(e)
+    $.ui.log(reviveLine(s, now))
     return { consumed: 'cache-tax revive' }
   })
 
@@ -918,8 +935,12 @@ export const register: Register = on => {
     // origin but the human ones, and an SDK turn in a known automated envelope, named by its envelope.
     const envelope = ENVELOPE.exec(e.text)
     const unattended = !HUMAN_ORIGINS.has(e.origin.kind) || envelope !== null
-    // A revive Claude Desktop handed in as a turn: the restart already re-armed keepwarm, a turn would only spend.
-    if (unattended && e.text.includes(REVIVE_MARK)) return { drop: `cache-tax: ${reviveLine(s, now)}` }
+    // A revive, queued from a peer delivery or handed in by Claude Desktop as a turn, runs as that turn while the cache is warm.
+    if (unattended && e.text.includes(REVIVE_MARK)) {
+      if (!reviveRuns(s, now)) return { drop: `cache-tax: ${reviveLine(s, now)}` }
+      $.ui.log(reviveLine(s, now))
+      return next(e)
+    }
     if (!isCold(s, now) || s.ctx < BIG_TOKENS) {
       clearBlocked($, s)
       return next(e)
@@ -966,6 +987,8 @@ export const register: Register = on => {
     if ((e.usage || !e.isAborted) && now - s.lastRequestAt > e.durationMs) s.lastRequestAt = now
     s.compacted = false
     s.waitForTurn = false
+    // The engine saves what a fork needs from each main-thread request; a turn with usage made one.
+    if (e.usage) s.primed = true
     s.ackedAt = 0
     // Always covers any break up to six hours: each turn that reached the cache opens a window of at least six hours
     // at the default period, which brings back a stopped window, lengthens a shorter one and replaces a testing period.

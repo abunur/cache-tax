@@ -1032,11 +1032,13 @@ describe('restart after a quit', () => {
     await clock.advance(3000)
     expect(w.sent.map(m => m.to)).toEqual(['local_w'])
     expect(w.sent[0].text).toMatch(/^\[cache-tax revive\]/)
+    // The revive is the new process's first turn, so it asks for the least a turn can be.
+    expect(w.sent[0].text).toMatch(/Reply with the single word: warm\. Use no tools and send no messages\.$/)
     const bear = w.runs.find(a => a[0].endsWith('bearcli'))!
     expect(bear[1]).toBe('create')
     expect(bear[2]).toMatch(/^Keepwarm sessions after Claude quit, /)
     const body = bear[4]
-    expect(body).toMatch(/\*\*Recap\*\*: restarted automatically with 40m of warm cache left; its window is kept and pings resume after its next turn, so one message there before /)
+    expect(body).toMatch(/\*\*Recap\*\*: restarted automatically with 40m of warm cache left; it runs one short turn to re-read its cache, so its window is kept and pings resume 50m after that turn\. \[Open\]/)
     expect(body).toMatch(/\*\*Old\*\*: cold since .*; reopening it re-writes 200,000 tokens, about \$1\.60\. \[Open\]\(claude:\/\/code\/continue\?session=local_c\)/)
     expect(body).toMatch(/\*\*Upgraded\*\*: not restarted, because Claude Code changed from 2\.1\.298 to 2\.1\.299/)
     expect(body).not.toMatch(/Gone|local_o/)
@@ -1091,7 +1093,7 @@ describe('restart after a quit', () => {
     expect(w.logs.at(-1)).toMatch(/Details in \/Users\/me\/\.claude\/cache-tax-report\.md/)
   })
 
-  test('a revived session takes its warm clock from its record, pings, and swallows the revive message', async ($, on) => {
+  test('a revived session takes its warm clock from its record and runs the revive message as its one turn', async ($, on) => {
     const now = START + 20 * MIN
     const clock = mock.clock(on, { now })
     const store = new Map<string, unknown>([['deadline:S1', START + 48 * HOUR], ['rec:S1', rec({ warmAt: START, endedAt: START + 15 * MIN })]])
@@ -1101,26 +1103,73 @@ describe('restart after a quit', () => {
     await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 3 * 3600, context_tokens: 200000, prompt_cache_likely_expired: true, model: 'claude-opus-5-5' })
     expect(w.logs.some(l => l.startsWith('resuming cold'))).toBe(false)
     expect((store.get('rec:S1') as Rec).endedAt).toBe(undefined)
+    // A peer delivery is queued as it came; the line is logged once it comes in as the turn.
     const got = await $.session.receive({ origin: { kind: 'peer' }, text: '[cache-tax revive] Claude restarted' })
-    expect(got.consumed).toBe('cache-tax revive')
-    expect(w.logs.at(-1)).toMatch(/restarted after Claude came back with 40m of warm cache left/)
-    const asTurn = await $.prompt.submit({ text: '<cross-session-message from="local_m">[cache-tax revive] Claude restarted</cross-session-message>', wait: false, origin: { kind: 'sdk' } })
-    expect(asTurn.drop).toMatch(/^cache-tax: restarted after Claude came back/)
-    expect(w.entered).toEqual([])
-    await clock.advance(30 * MIN)
+    expect(got).toEqual({ text: '[cache-tax revive] Claude restarted' })
+    expect(w.logs).toEqual([])
+    const wrapped = '<cross-session-message from="local_m">[cache-tax revive] Claude restarted</cross-session-message>'
+    const asTurn = await $.prompt.submit({ text: wrapped, wait: false, origin: { kind: 'sdk' } })
+    expect(asTurn.drop).toBe(undefined)
+    expect(w.entered).toEqual([wrapped])
+    expect(w.logs.at(-1)).toBe('restarted after Claude came back with 40m of warm cache left; running one short turn so the new process has a conversation to fork, and pings resume 50m after it')
+    await $.turn.complete(turn({ usage: usage({ model: 'claude-opus-5-5' }) }))
+    // That turn read the cache at 20m, so the first ping comes 50m after it rather than at the record's 50m mark.
+    await clock.advance(49 * MIN)
+    expect(w.forks.length).toBe(0)
+    await clock.advance(MIN)
     expect(w.forks.length).toBe(1)
+    expect((store.get('rec:S1') as Rec).warmAt).toBe(now + 50 * MIN)
   })
 
-  test('a revived process with nothing to fork yet keeps its window and pings again after its next turn', async ($, on) => {
+  test('a revive delivered after the cache went cold is taken without a turn', async ($, on) => {
+    const T = 100 * HOUR
+    mock.clock(on, { now: T + 61 * MIN })
+    const store = new Map<string, unknown>([['deadline:S1', T + 48 * HOUR], ['rec:S1', rec({ at: T, warmAt: T, endedAt: T + 15 * MIN, deadline: T + 48 * HOUR })]])
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 3 * 3600, context_tokens: 200000, model: 'claude-opus-5-5' })
+    const cold = 'restarted after Claude came back, but the cache had already gone cold; keepwarm waits for the next turn'
+    const got = await $.session.receive({ origin: { kind: 'peer' }, text: '[cache-tax revive] Claude restarted' })
+    expect(got.consumed).toBe('cache-tax revive')
+    expect(w.logs.at(-1)).toBe(cold)
+    // The same message handed in as a turn would re-write the whole context; it is dropped, not priced and sent.
+    const asTurn = await $.prompt.submit({ text: '<cross-session-message from="local_m">[cache-tax revive] Claude restarted</cross-session-message>', wait: false, origin: { kind: 'sdk' } })
+    expect(asTurn.drop).toBe(`cache-tax: ${cold}`)
+    expect(w.entered).toEqual([])
+  })
+
+  test('a revive is taken without a turn when the process has run one already, until a /resume loads another conversation', async ($, on) => {
+    const T = 100 * HOUR
+    mock.clock(on, { now: T + 20 * MIN })
+    const store = new Map<string, unknown>([['deadline:S1', T + 48 * HOUR], ['rec:S1', rec({ at: T, warmAt: T, endedAt: T + 15 * MIN, deadline: T + 48 * HOUR })]])
+    const w = world(on, [], { store })
+    await $.session.start(session)
+    await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 3 * 3600, context_tokens: 200000, model: 'claude-opus-5-5' })
+    // The person got there first, and their turn gave the process a conversation to fork.
+    await $.turn.complete(turn())
+    const got = await $.session.receive({ origin: { kind: 'peer' }, text: '[cache-tax revive] Claude restarted' })
+    expect(got.consumed).toBe('cache-tax revive')
+    expect(w.logs.at(-1)).toBe('restarted after Claude came back with 1h00m of warm cache left; this process has run a turn already, so the window is kept and no other turn is needed')
+    const peer = await $.prompt.submit({ text: '[cache-tax revive] Claude restarted', wait: false, origin: { kind: 'peer' } as PromptSubmitInput['origin'] })
+    expect(peer.drop).toMatch(/this process has run a turn already/)
+    // Typed by a person, the marker is only text.
+    const typed = await $.prompt.submit(prompt('[cache-tax revive] what does this do?'))
+    expect(typed.drop).toBe(undefined)
+    expect(w.entered).toEqual(['[cache-tax revive] what does this do?'])
+    // A /resume in this process loads a conversation the engine has sent no request for.
+    await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 60, context_tokens: 200000, model: 'claude-opus-5-5' })
+    const again = await $.session.receive({ origin: { kind: 'peer' }, text: '[cache-tax revive] Claude restarted' })
+    expect(again.consumed).toBe(undefined)
+  })
+
+  test('a restored window with nothing to fork yet keeps its window and pings again after the next turn', async ($, on) => {
     const T = 100 * HOUR
     const clock = mock.clock(on, { now: T + 20 * MIN })
     const store = new Map<string, unknown>([['deadline:S1', T + 48 * HOUR], ['rec:S1', rec({ at: T, warmAt: T, endedAt: T + 15 * MIN, deadline: T + 48 * HOUR })]])
     const w = world(on, [nothing, warm], { store })
     await $.session.start(session)
     await $.classic.SessionStart({ source: 'resume', seconds_since_last_response: 3 * 3600, context_tokens: 200000, prompt_cache_likely_expired: true, model: 'claude-opus-5-5' })
-    await $.session.receive({ origin: { kind: 'peer' }, text: '[cache-tax revive] Claude restarted' })
-    expect(w.logs.at(-1)).toMatch(/40m of warm cache left; the window is kept and no turn was run, and pings resume after the next turn here/)
-    // The ping due 50m after the recorded touch finds no conversation in the new process.
+    // No revive reached this process, so the ping due 50m after the recorded touch finds no conversation to fork.
     await clock.advance(30 * MIN)
     expect(w.forks.length).toBe(1)
     expect(w.status.at(-1)).toMatch(/nothing to fork yet, first ping after the next turn/)
