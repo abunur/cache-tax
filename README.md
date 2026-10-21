@@ -9,7 +9,26 @@
 
 Cache Tax is a Claude Code mod that refreshes your prompt cache while you step away and shows the estimated rewrite cost before a cold send. Run `/keepwarm 90m` before a break. Pings cost tokens; choose a window you expect to return within.
 
-**[Install](#install)** · [Website](https://cachetax.aidojo.si/) · [How it works](#how-it-works) · [Costs and limits](#cost-and-the-plan-limit-question) · [Commands](#commands)
+**[This fork](#this-fork)** · [Install](#install) · [Website](https://cachetax.aidojo.si/) · [How it works](#how-it-works) · [Costs and limits](#cost-and-the-plan-limit-question) · [Commands](#commands)
+
+## This fork
+
+This is [abunur/cache-tax](https://github.com/abunur/cache-tax), branch `fuad`: a maintained fork of [karanb192/cache-tax](https://github.com/karanb192/cache-tax) 2.3.0, versioned `2.3.0-resend.3`. Everything upstream does, this fork does too; the differences are additions and a few changed defaults. It replaces `cache-tax@claude-code-mods`, so never enable both.
+
+| Area | Upstream 2.3.0 | This fork |
+|---|---|---|
+| Refused cold send | Resend the message by hand to pay the rewrite | Also a **Resend and pay** button in the row above the prompt |
+| Who the guard stops | Anything a person may have sent: composer, Remote Control, Slack and channel messages, SDK hosts and unclassified prompts | Only the composer, Remote Control, SDK hosts and Slack pings; channel messages, relays, unclassified prompts and SDK turns that Claude Desktop wraps in a known automated envelope (a cross-session message and three others) go through with the price logged, since nobody is there to resend them |
+| Claude quitting or updating | A window ends with the process; a restored window waits for your next turn | Each session leaves a record of its cache clock at shutdown; the next session to start revives every session whose cache is still warm with one short turn so pings resume, and lists the rest with their reopening price in a Bear note tagged `claude/keepwarm` (or `~/.claude/cache-tax-report.md`) plus a macOS notification. A detached watcher reopens one session if the whole app quits and comes back while the cache is warm. See [When Claude quits](#how-it-works) |
+| `/keepwarm always` after a longer window | Turning `always` on resets the window to six hours | A longer window you set (say `/keepwarm 48h`) keeps its deadline; only the ping period goes back to 50 minutes |
+| A turn that reached no cache | Rolls the `always` window like any other turn | Does not roll the window or reopen one that ran out |
+| `/keepwarm off` racing a turn | A turn writing its window at the same moment can win | `off` always wins, including over a turn whose request was already out and over a cold write's auto-warm |
+| Cache displays | No published state | Each warm ping publishes `cache-tax.lastPing` (`{ at, read, write }`, typed in [`types/index.d.ts`](types/index.d.ts)) so a display such as cache-meter can restart its countdown |
+| Tests | 137 | 168, covering every addition above |
+
+Because the revive and report features run host commands (`bearcli`, `osascript`, a detached `/bin/sh` watcher, `open` of a `claude://` link) and send messages to other local sessions, the fork's reach is wider than upstream's; the [threat model](#what-it-can-reach) lists all of it.
+
+**Keeping up with upstream.** Upstream changes come in by merging `upstream/main` (never a PR head) into `fuad`, running `claude plugin test .`, and pushing to this fork. Nothing flows the other way, except as a pull request upstream. The rolling `/keepwarm always` window started here and shipped upstream as karanb192/cache-tax#28 in 2.3.0.
 
 ![Real recording of cache-tax stopping a cold send with a $6.61 estimate](site/assets/refusal.gif)
 
@@ -19,10 +38,13 @@ A two-line recap in a 330k-token session triggered a **$6.61 estimate**. After r
 
 Needs [Claude Code 2.1.287 or later](https://code.claude.com/docs/en/plugins/mods/overview#turn-mods-on-or-off), a one-hour cache and Claude Code left running. Mods are on by default. Pings cost tokens, including uncapped output.
 
+This fork is not in a marketplace. Clone the `fuad` branch and load the folder as a plugin directory:
+
 ```sh
-claude plugin marketplace add karanb192/claude-code-mods
-claude plugin install cache-tax@claude-code-mods
+git clone -b fuad https://github.com/abunur/cache-tax.git ~/.claude/mods/cache-tax-local
 ```
+
+Then add that path to `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of `~/.claude/settings.json`, or pass `--plugin-dir ~/.claude/mods/cache-tax-local` for a single session. If the upstream copy (`cache-tax@claude-code-mods`) is installed, disable it first; two copies mean two guards and two ping loops. Update with `git -C ~/.claude/mods/cache-tax-local pull`. The upstream install, for comparison, is `claude plugin install cache-tax@claude-code-mods` from the `karanb192/claude-code-mods` marketplace.
 
 Restart Claude Code or run `/reload-plugins` in an open session. No early-access flag is needed. If you set `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS` previously, remove it; current Claude Code ignores it.
 
