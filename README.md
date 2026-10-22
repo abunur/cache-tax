@@ -13,7 +13,7 @@ Cache Tax is a Claude Code mod that refreshes your prompt cache while you step a
 
 ## This fork
 
-This is [abunur/cache-tax](https://github.com/abunur/cache-tax), branch `fuad`: a maintained fork of [karanb192/cache-tax](https://github.com/karanb192/cache-tax) 2.3.0, versioned `2.3.0-resend.3`. Everything upstream does, this fork does too; the differences are additions and a few changed defaults. It replaces `cache-tax@claude-code-mods`, so never enable both.
+This is [abunur/cache-tax](https://github.com/abunur/cache-tax): a maintained fork of [karanb192/cache-tax](https://github.com/karanb192/cache-tax) 2.3.0, versioned `2.3.0-resend.3`. Everything upstream does, this fork does too; the differences are additions and a few changed defaults. It replaces `cache-tax@claude-code-mods`, so never enable both.
 
 | Area | Upstream 2.3.0 | This fork |
 |---|---|---|
@@ -28,7 +28,7 @@ This is [abunur/cache-tax](https://github.com/abunur/cache-tax), branch `fuad`: 
 
 Because the revive and report features run host commands (`bearcli`, `osascript`, a detached `/bin/sh` watcher, `open` of a `claude://` link) and send messages to other local sessions, the fork's reach is wider than upstream's; the [threat model](#what-it-can-reach) lists all of it.
 
-**Keeping up with upstream.** Upstream changes come in by merging `upstream/main` (never a PR head) into `fuad`, running `claude plugin test .`, and pushing to this fork. Nothing flows the other way, except as a pull request upstream. The rolling `/keepwarm always` window started here and shipped upstream as karanb192/cache-tax#28 in 2.3.0.
+**Keeping up with upstream.** Upstream changes come in by merging `upstream/main` (never a PR head) into this fork's `main`, running `claude plugin test .`, and pushing to this fork. Nothing flows the other way, except as a pull request upstream, cut from `upstream/main` onto its own topic branch. The rolling `/keepwarm always` window started here and shipped upstream as karanb192/cache-tax#28 in 2.3.0.
 
 ![Real recording of cache-tax stopping a cold send with a $6.61 estimate](site/assets/refusal.gif)
 
@@ -38,10 +38,10 @@ A two-line recap in a 330k-token session triggered a **$6.61 estimate**. After r
 
 Needs [Claude Code 2.1.287 or later](https://code.claude.com/docs/en/plugins/mods/overview#turn-mods-on-or-off), a one-hour cache and Claude Code left running. Mods are on by default. Pings cost tokens, including uncapped output.
 
-This fork is not in a marketplace. Clone the `fuad` branch and load the folder as a plugin directory:
+This fork is not in a marketplace. Clone it and load the folder as a plugin directory:
 
 ```sh
-git clone -b fuad https://github.com/abunur/cache-tax.git ~/.claude/mods/cache-tax-local
+git clone https://github.com/abunur/cache-tax.git ~/.claude/mods/cache-tax-local
 ```
 
 Then add that path to `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of `~/.claude/settings.json`, or pass `--plugin-dir ~/.claude/mods/cache-tax-local` for a single session. If the upstream copy (`cache-tax@claude-code-mods`) is installed, disable it first; two copies mean two guards and two ping loops. Update with `git -C ~/.claude/mods/cache-tax-local pull`. The upstream install, for comparison, is `claude plugin install cache-tax@claude-code-mods` from the `karanb192/claude-code-mods` marketplace.
