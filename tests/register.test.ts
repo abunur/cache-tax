@@ -998,6 +998,28 @@ describe('restart after a quit', () => {
     expect(watcher?.slice(-3)).toEqual([String(Math.floor((START + HOUR - 3 * MIN) / 1000)), 'claude://code/continue?session=local_s1', '/Users/me/.claude/cache-tax-revive.lock'])
   })
 
+  test('a reload mid-session keeps pinging from the record and ends with its cache clock, not none', async ($, on) => {
+    // A plugin reload or a respawned hooks worker runs session.start again in a fresh module, and no resume follows it.
+    const T = 100 * HOUR
+    const clock = mock.clock(on, { now: T + 40 * MIN })
+    const store = new Map<string, unknown>([
+      ['deadline:S1', T + 48 * HOUR],
+      ['rec:S1', rec({ at: T + 30 * MIN, warmAt: T + 30 * MIN, deadline: T + 48 * HOUR, endedAt: undefined, endReason: undefined })],
+    ])
+    const w = world(on, [warm], { store, home: '/Users/me', run: lookup('S1', 'local_s1', 'Recap') })
+    await $.session.start(session)
+    await clock.advance(39 * MIN)
+    expect(w.forks.length).toBe(0)
+    // The record's last ping was at 30m, so the next is due 50m after it.
+    await clock.advance(MIN)
+    expect(w.forks.length).toBe(1)
+    expect((store.get('rec:S1') as Rec).warmAt).toBe(T + 80 * MIN)
+    await clock.advance(10 * MIN)
+    await $.session.end(ended())
+    expect(store.get('rec:S1') as Rec).toMatchObject({ warmAt: T + 80 * MIN, endedAt: T + 90 * MIN })
+    expect(w.runs.some(a => a[0] === '/usr/bin/perl')).toBe(true)
+  })
+
   test('no watcher when the cache is about to go cold, the window is off, or the session cleared', async ($, on) => {
     const clock = mock.clock(on, { now: START })
     const store = new Map<string, unknown>()

@@ -790,6 +790,13 @@ export const register: Register = on => {
       s.lastStop = own.stop ?? null
       s.title = own.title
       if (own.local) s.local = own.local
+      // A plugin reload or a respawned hooks worker starts a fresh module mid-conversation, and no resume follows to
+      // seed the cache clock. Without the record's, pings stop and the next save writes the record back with none.
+      if (own.warmAt > s.lastRequestAt) {
+        s.lastRequestAt = own.warmAt
+        s.ctx = own.ctx
+        s.lastModel = own.model
+      }
     }
     const now = await $.clock.now()
     await prune($, s, now)
@@ -821,6 +828,8 @@ export const register: Register = on => {
     if (commands.some(c => c.name === 'cache-tax:status')) {
       $.ui.log('the hook form (cache-tax@claude-code-hooks) is also installed, so a cold send is warned about or refused twice. Uninstall it, or /cache-tax guard warn here.')
     }
+    // A reload has no resume to arm the window it restored; on a resume, the resume handler arms it again.
+    await arm($, s)
     updateStatus($, s, now)
     // Off the start's own path: the first session back after a quit revives or reports the rest.
     $.clock.after(3000, () => { void reviveOthers($, s) })
